@@ -22,7 +22,9 @@ PRESETS="0 16 100 200 299"
 echo "=== capturing on $HOST (about 6 minutes: every run boots the firmware) ==="
 ssh "$HOST" "mkdir -p $DEVICE_DIR/battery && cd $DEVICE_DIR && \
   for p in $PRESETS; do \
-    taskset 0x7 ./dump_presets $MODULE/roms/*.[bB][iI][nN] render 50 \$p battery/R\$p.wav 2 6 >/dev/null 2>&1; \
+    for take in "" b c; do \
+      taskset 0x7 ./dump_presets $MODULE/roms/*.[bB][iI][nN] render 50 \$p battery/R\$p\$take.wav 2 6 >/dev/null 2>&1; \
+    done; \
     VAVRA_HOLD=1 VAVRA_MODE=single VAVRA_PRESET=\$p VAVRA_PLAY_CH=1 \
       VAVRA_WAV=battery/single_\$p.wav ./module_smoke $MODULE - 2 >/dev/null 2>&1; \
   done; \

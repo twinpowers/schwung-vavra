@@ -424,6 +424,67 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // "setparam <index> <value> [<index> <value> ...]": write single
+    // parameters and read the edit buffer back, to establish that a
+    // SingleParameterChange lands -- the packet carries a part byte before
+    // the index, unlike a Multi parameter change.
+    if(argc > 2 && !strcmp(argv[2], "setparam")) {
+        constexpr uint8_t Waldorf = 0x3e, MicroQ = 0x10, Omni = 0x7f;
+        auto spin = [&](int blocks) {
+            for(int block = 0; block < blocks; ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+            }
+        };
+        auto readSingle = [&]() {
+            std::vector<uint8_t> dump;
+            synthLib::SMidiEvent request(synthLib::MidiEventSource::Host);
+            request.sysex = {0xf0, Waldorf, MicroQ, Omni,
+                static_cast<uint8_t>(mqLib::SysexCommand::SingleRequest),
+                static_cast<uint8_t>(mqLib::MidiBufferNum::SingleEditBufferSingleMode),
+                static_cast<uint8_t>(mqLib::MidiSoundLocation::EditBufferCurrentSingle), 0xf7};
+            midiIn.clear(); midiIn.push_back(request);
+            for(int block = 0; block < 2000 && dump.empty(); ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+                for(const auto& reply : midiOut)
+                    if(reply.sysex.size() > 8 &&
+                       reply.sysex[4] == static_cast<uint8_t>(mqLib::SysexCommand::SingleDump))
+                        dump.assign(reply.sysex.begin(), reply.sysex.end());
+            }
+            return dump;
+        };
+        spin(400);
+        auto before = readSingle();
+        if(before.empty()) { fprintf(out, "no Single dump\n"); return 1; }
+        for(int i = 3; i + 1 < argc; i += 2) {
+            const int index = atoi(argv[i]);
+            const uint8_t value = static_cast<uint8_t>(atoi(argv[i + 1]));
+            synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
+            event.sysex = {0xf0, Waldorf, MicroQ, Omni,
+                static_cast<uint8_t>(mqLib::SysexCommand::SingleParameterChange),
+                0x00,                                        // part
+                static_cast<uint8_t>(index >> 7), static_cast<uint8_t>(index & 0x7f),
+                value, 0xf7};
+            midiIn.clear(); midiIn.push_back(event);
+            spin(300);
+        }
+        spin(600);
+        auto after = readSingle();
+        if(after.empty()) { fprintf(out, "no Single dump after the writes\n"); return 1; }
+        for(int i = 3; i + 1 < argc; i += 2) {
+            const int index = atoi(argv[i]);
+            const int wanted = atoi(argv[i + 1]);
+            const size_t at = mqLib::IdxSingleParamFirst + index;
+            fprintf(out, "index %3d: before=%3d wanted=%3d after=%3d  %s\n", index,
+                    at < before.size() ? before[at] : -1, wanted,
+                    at < after.size() ? after[at] : -1,
+                    (at < after.size() && after[at] == wanted) ? "OK" : "NOT APPLIED");
+        }
+        return 0;
+    }
     // "multi": switch the firmware to Multi mode and play one channel at a
     // time, to establish that the 16 parts really do answer separately before
     // any of it is exposed as module parameters.

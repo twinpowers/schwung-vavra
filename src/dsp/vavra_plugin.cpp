@@ -4,6 +4,7 @@
 #include "plugin_api.h"
 #include "runtime.h"
 #include "presets_os223.h"
+#include "vavra_ui.h"
 #include "mqLib/device.h"
 #include "mqLib/mqmiditypes.h"
 #include "mqLib/rom.h"
@@ -73,6 +74,8 @@ constexpr int MultiParts=16, MultiInstStride=22;
 // MultiParameter::Count -- the payload of a Multi dump, between the 7-byte
 // header and the checksum.
 constexpr int MultiDataBytes=384;
+// The Single dump's payload, indexed the same way the parameter table is.
+constexpr int SingleDataBytes=383;
 // The gap between a part edit and the Multi dump that carries it.
 constexpr int MultiSendDelayMs=300;
 constexpr int PartSoundBankOffset=0, PartSoundNumberOffset=1,
@@ -93,6 +96,7 @@ struct Midi { uint16_t size=0; uint8_t bytes[1024]{}; };
 // A queued firmware write. `multi` selects between a Global parameter change
 // and a byte of the Multi, which is not sent as a parameter change at all --
 // see the child's sendMulti below.
+// kind: 0 = Global parameter, 1 = a byte of the Multi, 2 = a Single parameter.
 struct ParamWrite { uint16_t index=0; uint8_t value=0; uint8_t multi=0; };
 struct Shared {
     vavra::Ring<Stereo,8192> audio;
@@ -112,6 +116,11 @@ struct Shared {
     // What the host last WROTE, verbatim, so a value we could not parse is
     // visible on the device instead of silently becoming option 0.
     char lastPresetWrite[64]{}, lastModeWrite[32]{};
+    // The edit buffer's parameter bytes. A page repaint reads eight of these;
+    // asking the emulator for each would be eight sysex round trips per frame.
+    std::atomic<uint8_t> single[SingleDataBytes]{};
+    std::atomic<int> singleReady{0};
+    std::atomic<uint32_t> singleWrites{0}, singleQueued{0}, lastSingleIndex{9999}, lastSingleValue{0};
     std::atomic<uint32_t> underruns{0}, midiDrops{0}, blocks{0}, bootMs{0}, cpuMs{0};
     std::atomic<uint32_t> warmupBlocks{0};
     // Producer-side truth: the longest single emulator step, and how
@@ -254,6 +263,34 @@ static void childMain(Instance* inst) {
             static_cast<synthLib::Device&>(device).process(inputs,outputs,Chunk,midiIn,midiOut);
         }
         shm->warmupBlocks=warmBlock;
+        // Pull the edit buffer's parameters into the shadow. Called at boot and
+        // after every preset change: otherwise the grid would keep showing the
+        // previous patch's values, which is worse than showing none.
+        auto refreshSingle=[&]{
+            synthLib::SMidiEvent request(synthLib::MidiEventSource::Host);
+            request.sysex={0xf0,0x3e,static_cast<uint8_t>(mqLib::IdMicroQ),0x7f,
+                static_cast<uint8_t>(mqLib::SysexCommand::SingleRequest),
+                static_cast<uint8_t>(mqLib::MidiBufferNum::SingleEditBufferSingleMode),
+                static_cast<uint8_t>(mqLib::MidiSoundLocation::EditBufferCurrentSingle),0xf7};
+            midiIn.clear(); midiIn.push_back(std::move(request));
+            for(int block=0;block<2000;++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs,outputs,Chunk,midiIn,midiOut);
+                midiIn.clear();
+                bool got=false;
+                for(const auto& reply:midiOut) {
+                    const auto& sysex=reply.sysex;
+                    if(sysex.size()<static_cast<size_t>(mqLib::IdxSingleParamFirst)+SingleDataBytes) continue;
+                    if(sysex[4]!=static_cast<uint8_t>(mqLib::SysexCommand::SingleDump)) continue;
+                    for(int i=0;i<SingleDataBytes;++i)
+                        shm->single[i]=sysex[mqLib::IdxSingleParamFirst+i];
+                    shm->singleReady=1;
+                    got=true;
+                }
+                if(got) break;
+            }
+        };
+
         // Ask for the Multi the firmware booted with, so edits start from the
         // real thing rather than from an assumption about it.
         std::vector<uint8_t> multiData;
@@ -277,9 +314,11 @@ static void childMain(Instance* inst) {
             }
             shm->multiReady=multiData.size()==MultiDataBytes ? 1 : 0;
         }
+        refreshSingle();
         shm->bootMs=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-start).count();
         auto boostUntil=Clock::now();
         auto multiSendAt=Clock::now();
+        Clock::time_point singleStale{};
         bool multiPending=false;
         const auto cpuStart=cpuMs();
         for(;;) {
@@ -311,6 +350,25 @@ static void childMain(Instance* inst) {
             ParamWrite write;
             bool multiDirty=false;
             while(shm->writes.pop(write)) {
+                if(write.multi==2) {
+                    // Single parameter change. The packet carries a part byte
+                    // before the index, which a Multi parameter change does
+                    // not -- and in Multi mode that part byte is what makes
+                    // the edit land on the selected instrument.
+                    const int part=shm->multiMode.load()
+                        ? std::clamp(shm->part.load(),1,MultiParts)-1 : 0;
+                    synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
+                    event.sysex={0xf0,0x3e,static_cast<uint8_t>(mqLib::IdMicroQ),0x7f,
+                        static_cast<uint8_t>(mqLib::SysexCommand::SingleParameterChange),
+                        static_cast<uint8_t>(part),
+                        static_cast<uint8_t>(write.index>>7),static_cast<uint8_t>(write.index&0x7f),
+                        write.value,0xf7};
+                    midiIn.push_back(std::move(event));
+                    if(write.index<SingleDataBytes) shm->single[write.index]=write.value;
+                    shm->singleWrites.fetch_add(1);
+                    shm->lastSingleIndex=write.index; shm->lastSingleValue=write.value;
+                    continue;
+                }
                 if(write.multi) {
                     if(write.index<multiData.size()) { multiData[write.index]=write.value; multiDirty=true; }
                     continue;
@@ -354,6 +412,25 @@ static void childMain(Instance* inst) {
                     static_cast<uint8_t>(index/PresetsPerBank));
                 midiIn.emplace_back(synthLib::MidiEventSource::Host,0xc0,
                     static_cast<uint8_t>(index%PresetsPerBank),0);
+                singleStale=Clock::now()+std::chrono::milliseconds(MultiSendDelayMs*2);
+            }
+            // Re-read the patch once it has settled, so the knobs show what
+            // was actually loaded rather than the previous sound's values.
+            //
+            // The REQUEST is queued here and the reply is picked up by the
+            // scan below, on ordinary frames. Draining it in place -- calling
+            // process() in a loop until the dump arrives -- produced audio
+            // that was never pushed to the queue, so every preset change tore
+            // a hole in the stream. The battery caught it as every preset
+            // matching its own reference three times worse than before.
+            if(singleStale!=Clock::time_point{} && Clock::now()>=singleStale) {
+                singleStale={};
+                synthLib::SMidiEvent request(synthLib::MidiEventSource::Host);
+                request.sysex={0xf0,0x3e,static_cast<uint8_t>(mqLib::IdMicroQ),0x7f,
+                    static_cast<uint8_t>(mqLib::SysexCommand::SingleRequest),
+                    static_cast<uint8_t>(mqLib::MidiBufferNum::SingleEditBufferSingleMode),
+                    static_cast<uint8_t>(mqLib::MidiSoundLocation::EditBufferCurrentSingle),0xf7};
+                midiIn.push_back(std::move(request));
             }
             Midi message;
             while(shm->midi.pop(message)) {
@@ -373,6 +450,12 @@ static void childMain(Instance* inst) {
             // authority for it: the names are not plain text in the ROM.
             for(const auto& event:midiOut) {
                 const auto& sysex=event.sysex;
+                if(sysex.size()>=static_cast<size_t>(mqLib::IdxSingleParamFirst)+SingleDataBytes &&
+                   sysex[4]==static_cast<uint8_t>(mqLib::SysexCommand::SingleDump)) {
+                    for(int i=0;i<SingleDataBytes;++i)
+                        shm->single[i]=sysex[mqLib::IdxSingleParamFirst+i];
+                    shm->singleReady=1;
+                }
                 if(sysex.size()<46) continue;
                 if(sysex[4]!=static_cast<uint8_t>(mqLib::SysexCommand::EmuLCD)) continue;
                 // The whole 20-char row: the name field is inset by two
@@ -546,6 +629,18 @@ static void setParam(void* context,const char* key,const char* value) {
         inst->shm->part=slot;
         inst->shm->preset=inst->shm->partPreset[slot-1].load();
     }
+    // A generated synth parameter: look it up, map the shown value onto the
+    // wire, and queue it. Linear scan over ~280 entries -- a set_param is a
+    // knob detent, not a per-frame cost.
+    for(const auto& mq : vavra::g_mqParams) {
+        if(strcmp(key,mq.key)) continue;
+        const int shown=atoi(value);
+        int raw=shown*mq.scale+mq.offset;
+        raw=std::clamp(raw,static_cast<int>(mq.rawMin),static_cast<int>(mq.rawMax));
+        inst->shm->writes.push({mq.index,static_cast<uint8_t>(raw),2});
+        inst->shm->singleQueued.fetch_add(1);
+        return;
+    }
     auto partWrite=[&](int field,int raw){
         const int slot=std::clamp(inst->shm->part.load(),1,MultiParts)-1;
         const int offset=static_cast<int>(mqLib::MultiParameter::Inst0)+slot*MultiInstStride+field;
@@ -577,17 +672,20 @@ static int getParam(void* context,const char* key,char* buffer,int size) {
     if(!strcmp(key,"name")) return snprintf(buffer,size,"microQ");
     if(!strcmp(key,"loading") || !strcmp(key,"is_loading")) return snprintf(buffer,size,"%d",!s->ready.load() && !s->failed.load() && !inst->workerError.load());
     if(!strcmp(key,"chain_params")) {
-        // Built here rather than stored: 300 option strings are ~7 KB, the
-        // host's ceiling is 65535 (SHADOW_PARAM_VALUE_LEN) and it REJECTS the
-        // module outright above it, so the write is bounded and checked.
-        int used=snprintf(buffer,size,"%s",R"([{"key":"preset","name":"Preset","type":"enum","default":0,"options":[)");
+        // Assembled here because the 300 preset options come from the
+        // compiled-in name table, and because the host's ceiling
+        // (SHADOW_PARAM_VALUE_LEN, 65535) REJECTS the whole module when the
+        // answer is longer -- so the write is bounded and reports failure.
+        int used=snprintf(buffer,size,"[%s",vavra::g_chainParamsHead);
+        used+=snprintf(buffer+used,size-used,"%s",R"("type":"enum","default":0,"options":[)");
         for(size_t i=0;i<sizeof(vavra::g_presetNames)/sizeof(*vavra::g_presetNames) && used<size;++i)
             used+=snprintf(buffer+used,size-used,"%s\"%s\"",i?",":"",vavra::g_presetNames[i]);
         if(used>=size) { buffer[0]=0; return -1; }
-        used+=snprintf(buffer+used,size-used,"%s",R"(]},{"key":"mode","name":"Mode","type":"enum","options":["Single","Multi"],"default":0},{"key":"part","name":"Part","type":"int","min":1,"max":16,"default":1,"visible_if":{"key":"mode","equals":1}},{"key":"part_channel","name":"Part Ch","short_name":"Ch","type":"int","min":0,"max":16,"default":0,"visible_if":{"key":"mode","equals":1}},{"key":"part_volume","name":"Part Vol","short_name":"Vol","type":"int","min":0,"max":127,"default":127,"visible_if":{"key":"mode","equals":1}},{"key":"dsp_clock","name":"DSP Clock","short_name":"Clock","type":"int","min":25,"max":100,"default":50,"unit":"%"},{"key":"gain","name":"Gain","type":"int","min":0,"max":100,"default":70},{"key":"buffer_ms","name":"Buffer","short_name":"Buf","type":"int","min":11,"max":139,"default":17,"unit":"ms"}])");
-        return used<size ? used : -1;
+        used+=snprintf(buffer+used,size-used,"]},%s]",vavra::g_chainParamsRest);
+        if(used>=size) { buffer[0]=0; return -1; }
+        return used;
     }
-    if(!strcmp(key,"ui_hierarchy")) return snprintf(buffer,size,"%s",R"({"pad_layout":"chromatic","levels":{"root":{"label":"microQ","knobs":["preset","mode","part","part_channel","part_volume","gain","dsp_clock","buffer_ms"],"params":["preset","mode","part","part_channel","part_volume","gain","dsp_clock","buffer_ms"]}}})");
+    if(!strcmp(key,"ui_hierarchy")) return snprintf(buffer,size,"%s",vavra::g_uiHierarchy);
     if(!strcmp(key,"loading_status")) return snprintf(buffer,size,"%s",s->ready.load() ? "Ready" : "Booting microQ...");
     if(!strcmp(key,"dsp_clock")) return snprintf(buffer,size,"%d",s->clock.load());
     if(!strcmp(key,"gain")) return snprintf(buffer,size,"%d",s->gain.load());
@@ -599,9 +697,21 @@ static int getParam(void* context,const char* key,char* buffer,int size) {
     if(!strcmp(key,"part_volume")) return snprintf(buffer,size,"%d",s->partVolume[std::clamp(s->part.load(),1,MultiParts)-1].load());
     // The LIVE name, off the device's own display -- so a ROM whose sounds
     // differ from the compiled-in table still reports the truth.
+    for(const auto& mq : vavra::g_mqParams) {
+        if(strcmp(key,mq.key)) continue;
+        // Before the edit buffer has been read, a value would be a guess.
+        if(!s->singleReady.load()) { buffer[0]=0; return 0; }
+        const int raw=mq.index<SingleDataBytes ? s->single[mq.index].load() : 0;
+        return snprintf(buffer,size,"%d",(raw-mq.offset)/(mq.scale?mq.scale:1));
+    }
     if(!strcmp(key,"multi_ready")) return snprintf(buffer,size,"%d",s->multiReady.load());
-    if(!strcmp(key,"writes")) return snprintf(buffer,size,"preset=<%s> mode=<%s> parsed_preset=%d parsed_mode=%d",
-        s->lastPresetWrite,s->lastModeWrite,s->preset.load(),s->multiMode.load());
+    // A parameter write is queued by the host thread and applied by the child;
+    // reading these back-to-back races them by design, so a zero here is only
+    // news if it stays zero.
+    if(!strcmp(key,"writes")) return snprintf(buffer,size,
+        "preset=<%s> mode=<%s> queued=%u applied=%u last=%u/%u single_ready=%d",
+        s->lastPresetWrite,s->lastModeWrite,s->singleQueued.load(),s->singleWrites.load(),
+        s->lastSingleIndex.load(),s->lastSingleValue.load(),s->singleReady.load());
     // The name of what is SELECTED, from the compiled-in table. It used to come
     // off the front panel, which is right in Single mode and wrong in Multi --
     // there row 2 shows the MULTI's name ("From TUS with <3"), so the name

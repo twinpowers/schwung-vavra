@@ -180,12 +180,42 @@ int main(int argc, char** argv) {
         const bool multi=!strcmp(scenarioMode,"multi");
         api->set_param(inst,"mode",multi?"1":"0");
         if(multi) {
-            setPart(1,envInt("VAVRA_PART1",0),1,127);
+            setPart(1,envInt("VAVRA_PART1",0),envInt("VAVRA_PART1_CH",1),envInt("VAVRA_PART1_VOL",127));
             setPart(2,envInt("VAVRA_PART2",16),envInt("VAVRA_PART2_CH",2),envInt("VAVRA_PART2_VOL",127));
-        } else {
+            // Parts 3 and 4 are opt-in, so a stack of four patches on one
+            // channel can be built without disturbing the two-part cases.
+            if(getenv("VAVRA_PART3")) setPart(3,envInt("VAVRA_PART3",0),envInt("VAVRA_PART3_CH",3),envInt("VAVRA_PART3_VOL",127));
+            if(getenv("VAVRA_PART4")) setPart(4,envInt("VAVRA_PART4",0),envInt("VAVRA_PART4_CH",4),envInt("VAVRA_PART4_VOL",127));
+        } else if(getenv("VAVRA_PRESET")) {
+            // Only when asked: selecting a preset re-reads the edit buffer a
+            // moment later, which would overwrite any parameter written here.
             snprintf(text,sizeof(text),"%d",envInt("VAVRA_PRESET",0));
             api->set_param(inst,"preset",text);
         }
+        // VAVRA_SET="key=value,key=value" exercises the generated synth
+        // parameters through the same path the knob grid uses.
+        if(getenv("VAVRA_PRESET") && getenv("VAVRA_SET"))
+            for(int i=0;i<345;++i) { api->render_block(inst,audio,128);
+                std::this_thread::sleep_for(std::chrono::microseconds(2902)); }
+        if(const char* sets=getenv("VAVRA_SET")) {
+            char copy[512]; snprintf(copy,sizeof(copy),"%s",sets);
+            for(char* item=strtok(copy,","); item; item=strtok(nullptr,",")) {
+                char* eq=strchr(item,'=');
+                if(!eq) continue;
+                *eq=0;
+                api->set_param(inst,item,eq+1);
+                printf("set %s=%s\n",item,eq+1);
+            }
+        }
+        if(const char* gets=getenv("VAVRA_GET")) {
+            char copy[512]; snprintf(copy,sizeof(copy),"%s",gets);
+            for(char* item=strtok(copy,","); item; item=strtok(nullptr,",")) {
+                char got[128]{};
+                const int n=api->get_param(inst,item,got,sizeof(got));
+                printf("get %s -> %s (len %d)\n",item,got,n);
+            }
+        }
+        if(api->get_param(inst,"writes",value,sizeof(value))>0) printf("writes: %s\n",value);
         noteChannel=std::clamp(envInt("VAVRA_PLAY_CH",1),1,16)-1;
         // Let every write land and the patch changes settle before playing.
         for(int i=0;i<1035;++i) { api->render_block(inst,audio,128);
@@ -276,6 +306,7 @@ int main(int argc, char** argv) {
             printf("wrote %s (%zu frames)\n",wavPath,capture.size()/2);
         }
     }
+    if(api->get_param(inst,"writes",value,sizeof(value))>0) printf("final writes: %s\n",value);
     if(api->get_param(inst,"stalls",value,sizeof(value))>0) printf("%s\n",value);
     start=Clock::now(); api->destroy_instance(inst);
     printf("destroy_seconds=%.6f\n",seconds(start));
