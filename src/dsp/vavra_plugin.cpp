@@ -70,6 +70,13 @@ constexpr int BankCount=3, PresetsPerBank=100;
 // The Multi holds 16 instruments at a fixed 22-byte stride (MultiParameter::
 // Inst0..Inst15). Part n answers on MIDI channel n by default.
 constexpr int MultiParts=16, MultiInstStride=22;
+// MultiParameter::Count -- the payload of a Multi dump, between the 7-byte
+// header and the checksum.
+constexpr int MultiDataBytes=384;
+// The gap between a part edit and the Multi dump that carries it.
+constexpr int MultiSendDelayMs=300;
+constexpr int PartSoundBankOffset=0, PartSoundNumberOffset=1,
+              PartChannelOffset_=2, PartVolumeOffset=3;
 // Inst<n>MidiChannel encodes MIDI channel c (1-based) as c+1: measured, part 1
 // carries 2 and answers on channel 1. 0 and 1 are the global/omni settings.
 constexpr int PartChannelOffset=2;
@@ -83,6 +90,9 @@ struct Midi { uint16_t size=0; uint8_t bytes[1024]{}; };
 // A firmware parameter write, queued for the child to emit as sysex. Generic
 // on purpose: every Multi and Global parameter is addressed the same way, so
 // exposing another one later costs a key, not a mechanism.
+// A queued firmware write. `multi` selects between a Global parameter change
+// and a byte of the Multi, which is not sent as a parameter change at all --
+// see the child's sendMulti below.
 struct ParamWrite { uint16_t index=0; uint8_t value=0; uint8_t multi=0; };
 struct Shared {
     vavra::Ring<Stereo,8192> audio;
@@ -96,9 +106,12 @@ struct Shared {
     // Multi mode: 16 parts, each with its own sound, channel and volume. The
     // firmware boots in SINGLE mode on omni, where every channel plays the one
     // sound -- which is why a slot's forward channel appears to do nothing.
-    std::atomic<int> multiMode{0}, part{1};
+    std::atomic<int> multiMode{0}, part{1}, multiReady{0};
     std::atomic<int> partPreset[MultiParts]{}, partChannel[MultiParts]{}, partVolume[MultiParts]{};
     char lcdName[24]{};
+    // What the host last WROTE, verbatim, so a value we could not parse is
+    // visible on the device instead of silently becoming option 0.
+    char lastPresetWrite[64]{}, lastModeWrite[32]{};
     std::atomic<uint32_t> underruns{0}, midiDrops{0}, blocks{0}, bootMs{0}, cpuMs{0};
     std::atomic<uint32_t> warmupBlocks{0};
     // Producer-side truth: the longest single emulator step, and how
@@ -241,8 +254,33 @@ static void childMain(Instance* inst) {
             static_cast<synthLib::Device&>(device).process(inputs,outputs,Chunk,midiIn,midiOut);
         }
         shm->warmupBlocks=warmBlock;
+        // Ask for the Multi the firmware booted with, so edits start from the
+        // real thing rather than from an assumption about it.
+        std::vector<uint8_t> multiData;
+        {
+            synthLib::SMidiEvent request(synthLib::MidiEventSource::Host);
+            request.sysex={0xf0,0x3e,static_cast<uint8_t>(mqLib::IdMicroQ),0x7f,
+                static_cast<uint8_t>(mqLib::SysexCommand::MultiRequest),
+                static_cast<uint8_t>(mqLib::MidiBufferNum::MultiEditBuffer),0x00,0xf7};
+            midiIn.clear(); midiIn.push_back(std::move(request));
+            for(int block=0;block<2000 && multiData.empty();++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs,outputs,Chunk,midiIn,midiOut);
+                midiIn.clear();
+                for(const auto& reply:midiOut) {
+                    const auto& sysex=reply.sysex;
+                    if(sysex.size()<static_cast<size_t>(mqLib::IdxMultiParamFirst)+MultiDataBytes) continue;
+                    if(sysex[4]!=static_cast<uint8_t>(mqLib::SysexCommand::MultiDump)) continue;
+                    multiData.assign(sysex.begin()+mqLib::IdxMultiParamFirst,
+                                     sysex.begin()+mqLib::IdxMultiParamFirst+MultiDataBytes);
+                }
+            }
+            shm->multiReady=multiData.size()==MultiDataBytes ? 1 : 0;
+        }
         shm->bootMs=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-start).count();
         auto boostUntil=Clock::now();
+        auto multiSendAt=Clock::now();
+        bool multiPending=false;
         const auto cpuStart=cpuMs();
         for(;;) {
             // The warmup can only compile the patch that was loaded at boot.
@@ -260,42 +298,62 @@ static void childMain(Instance* inst) {
             midiIn.clear(); midiOut.clear();
             // Bank select is CC 32 on this firmware. CC 0 is accepted and
             // ignored -- every bank then reads back as A001-A100.
-            // Queued firmware parameter writes, emitted the way mqLib frames
-            // them: index split into a 7-bit high and low byte.
+            // Queued firmware writes. A Global parameter goes as a parameter
+            // change; a Multi byte does NOT.
+            //
+            // Writing Inst<n>SoundBank/SoundNumber as MultiParameterChange
+            // updates the Multi's DATA -- a read-back confirms the bytes land
+            // exactly where intended -- and the parts still do not load those
+            // sounds: measured, MIDI channel 1 then played instrument 4's
+            // patch. mqLib's own createInitState does not use parameter
+            // changes either; it sends a whole Multi. So the module keeps the
+            // Multi, edits it, and sends it back as one dump.
             ParamWrite write;
+            bool multiDirty=false;
             while(shm->writes.pop(write)) {
+                if(write.multi) {
+                    if(write.index<multiData.size()) { multiData[write.index]=write.value; multiDirty=true; }
+                    continue;
+                }
                 synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
                 event.sysex={0xf0,0x3e,static_cast<uint8_t>(mqLib::IdMicroQ),0x7f,
-                    static_cast<uint8_t>(write.multi ? mqLib::SysexCommand::MultiParameterChange
-                                                     : mqLib::SysexCommand::GlobalParameterChange),
+                    static_cast<uint8_t>(mqLib::SysexCommand::GlobalParameterChange),
                     static_cast<uint8_t>(write.index>>7),static_cast<uint8_t>(write.index&0x7f),
                     write.value,0xf7};
                 midiIn.push_back(std::move(event));
                 boostUntil=Clock::now()+std::chrono::seconds(BoostSeconds);
             }
+            // Debounced, and deliberately NOT in the same block as the writes
+            // that caused it. Sending the dump in the same process() call as
+            // the Single/Multi mode change left every part edit with no
+            // effect; the working sequence puts a gap between them. It also
+            // coalesces a run of knob edits into one dump.
+            if(multiDirty) multiSendAt=Clock::now()+std::chrono::milliseconds(MultiSendDelayMs);
+            if(multiPending && Clock::now()>=multiSendAt && multiData.size()==MultiDataBytes) {
+                synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
+                std::vector<uint8_t> sysex={0xf0,0x3e,static_cast<uint8_t>(mqLib::IdMicroQ),0x7f,
+                    static_cast<uint8_t>(mqLib::SysexCommand::MultiDump),
+                    static_cast<uint8_t>(mqLib::MidiBufferNum::DeprecatedMultiBankInternal),0};
+                sysex.insert(sysex.end(),multiData.begin(),multiData.end());
+                uint8_t checksum=0;
+                for(size_t i=4;i<sysex.size();++i) checksum+=sysex[i];
+                sysex.push_back(checksum&0x7f);
+                sysex.push_back(0xf7);
+                event.sysex.assign(sysex.begin(),sysex.end());
+                midiIn.push_back(std::move(event));
+                multiPending=false;
+                boostUntil=Clock::now()+std::chrono::seconds(BoostSeconds);
+            }
+            if(multiDirty) multiPending=true;
+            // Single mode only: a Program Change in Multi would retarget
+            // whatever the front panel has selected rather than the part.
             if(shm->presetPending.exchange(0)) {
                 boostUntil=Clock::now()+std::chrono::seconds(BoostSeconds);
                 const int index=std::clamp(shm->preset.load(),0,BankCount*PresetsPerBank-1);
-                const int bank=index/PresetsPerBank, program=index%PresetsPerBank;
-                // In Multi mode a Program Change would retarget whatever the
-                // front panel has selected; the part is addressed by writing
-                // its own sound fields instead.
-                if(shm->multiMode.load()) {
-                    const int slot=std::clamp(shm->part.load(),1,MultiParts)-1;
-                    const int base=static_cast<int>(mqLib::MultiParameter::Inst0)+slot*MultiInstStride;
-                    for(auto [field,value] : {std::pair{0,bank},std::pair{1,program}}) {
-                        synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
-                        const int address=base+field;
-                        event.sysex={0xf0,0x3e,static_cast<uint8_t>(mqLib::IdMicroQ),0x7f,
-                            static_cast<uint8_t>(mqLib::SysexCommand::MultiParameterChange),
-                            static_cast<uint8_t>(address>>7),static_cast<uint8_t>(address&0x7f),
-                            static_cast<uint8_t>(value),0xf7};
-                        midiIn.push_back(std::move(event));
-                    }
-                } else {
-                    midiIn.emplace_back(synthLib::MidiEventSource::Host,0xb0,32,static_cast<uint8_t>(bank));
-                    midiIn.emplace_back(synthLib::MidiEventSource::Host,0xc0,static_cast<uint8_t>(program),0);
-                }
+                midiIn.emplace_back(synthLib::MidiEventSource::Host,0xb0,32,
+                    static_cast<uint8_t>(index/PresetsPerBank));
+                midiIn.emplace_back(synthLib::MidiEventSource::Host,0xc0,
+                    static_cast<uint8_t>(index%PresetsPerBank),0);
             }
             Midi message;
             while(shm->midi.pop(message)) {
@@ -388,6 +446,25 @@ static void* workerMain(void* context) {
     return nullptr;
 }
 static void setParam(void*,const char*,const char*);
+// An enum arrives as an INDEX from some callers and as the OPTION LABEL from
+// others, and atoi() of a label is 0 -- which silently pins an enum to its
+// first option. For `preset` that is a loud sub-bass patch and for `mode` it
+// is Single, i.e. exactly "it only ever makes one sound and the mode switch
+// does nothing". Accept both, and refuse anything else rather than guess.
+static int parseEnum(const char* value,const char* const* options,int count) {
+    if(!value || !*value) return -1;
+    const char* scan=value;
+    while(*scan==' ') ++scan;
+    if(*scan=='-' || (*scan>='0' && *scan<='9')) {
+        bool digits=true;
+        for(const char* c=(*scan=='-'?scan+1:scan);*c;++c)
+            if(*c<'0' || *c>'9') { digits=false; break; }
+        if(digits) { const int index=atoi(scan); return (index>=0 && index<count) ? index : -1; }
+    }
+    for(int i=0;i<count;++i) if(!strcasecmp(scan,options[i])) return i;
+    return -1;
+}
+static const char* const g_modeOptions[]={"Single","Multi"};
 static void* create(const char* directory,const char*) {
     if(!directory || strlen(directory)>=1024) return nullptr;
     auto* inst=new(std::nothrow) Instance;
@@ -432,16 +509,35 @@ static void setParam(void* context,const char* key,const char* value) {
     if(!strcmp(key,"buffer_ms")) inst->shm->targetFill=std::clamp(atoi(value)*44100/1000,TargetFillMin,TargetFillMax);
     // The child owns the MIDI; these only record the wish and wake it.
     if(!strcmp(key,"preset")) {
-        inst->shm->preset=std::clamp(atoi(value),0,BankCount*PresetsPerBank-1);
-        if(inst->shm->multiMode.load())
-            inst->shm->partPreset[std::clamp(inst->shm->part.load(),1,MultiParts)-1]=inst->shm->preset.load();
-        inst->shm->presetPending=1;
+        snprintf(inst->shm->lastPresetWrite,sizeof(inst->shm->lastPresetWrite),"%s",value);
+        const int index=parseEnum(value,vavra::g_presetNames,BankCount*PresetsPerBank);
+        if(index<0) return;
+        inst->shm->preset=index;
+        if(inst->shm->multiMode.load()) {
+            // Address the part HERE. This used to raise a "pending" flag and
+            // let the child resolve the part when it drained -- so selecting a
+            // sound for part 1 and then moving to part 2 landed BOTH writes on
+            // part 2, and the part played a sound it was never given. Every
+            // other part key already captured the part at write time; this one
+            // has to as well.
+            const int slot=std::clamp(inst->shm->part.load(),1,MultiParts)-1;
+            inst->shm->partPreset[slot]=index;
+            const int base=static_cast<int>(mqLib::MultiParameter::Inst0)+slot*MultiInstStride;
+            inst->shm->writes.push({static_cast<uint16_t>(base+PartSoundBankOffset),
+                                    static_cast<uint8_t>(index/PresetsPerBank),1});
+            inst->shm->writes.push({static_cast<uint16_t>(base+PartSoundNumberOffset),
+                                    static_cast<uint8_t>(index%PresetsPerBank),1});
+        } else {
+            inst->shm->presetPending=1;
+        }
     }
     if(!strcmp(key,"mode")) {
-        const int multi=atoi(value) ? 1 : 0;
-        inst->shm->multiMode=multi;
+        snprintf(inst->shm->lastModeWrite,sizeof(inst->shm->lastModeWrite),"%s",value);
+        const int parsed=parseEnum(value,g_modeOptions,2);
+        if(parsed<0) return;
+        inst->shm->multiMode=parsed;
         inst->shm->writes.push({static_cast<uint16_t>(mqLib::GlobalParameter::SingleMultiMode),
-                                static_cast<uint8_t>(multi),0});
+                                static_cast<uint8_t>(parsed),0});
     }
     // The part selector is the module's own: it says which part the part keys
     // below address, and writes nothing to the firmware.
@@ -452,19 +548,19 @@ static void setParam(void* context,const char* key,const char* value) {
     }
     auto partWrite=[&](int field,int raw){
         const int slot=std::clamp(inst->shm->part.load(),1,MultiParts)-1;
-        const int address=static_cast<int>(mqLib::MultiParameter::Inst0)+slot*MultiInstStride+field;
-        inst->shm->writes.push({static_cast<uint16_t>(address),static_cast<uint8_t>(raw),1});
+        const int offset=static_cast<int>(mqLib::MultiParameter::Inst0)+slot*MultiInstStride+field;
+        inst->shm->writes.push({static_cast<uint16_t>(offset),static_cast<uint8_t>(raw),1});
         return slot;
     };
     if(!strcmp(key,"part_channel")) {
         // 0 selects the global channel; 1..16 are MIDI channels, which the
-        // firmware stores offset by one.
+        // firmware stores offset by one (part 1 carries 2 and answers ch 1).
         const int channel=std::clamp(atoi(value),0,MultiParts);
-        inst->shm->partChannel[partWrite(2,channel ? channel+PartChannelOffset-1 : 0)]=channel;
+        inst->shm->partChannel[partWrite(PartChannelOffset_,channel ? channel+PartChannelOffset-1 : 0)]=channel;
     }
     if(!strcmp(key,"part_volume")) {
         const int volume=std::clamp(atoi(value),0,127);
-        inst->shm->partVolume[partWrite(3,volume)]=volume;
+        inst->shm->partVolume[partWrite(PartVolumeOffset,volume)]=volume;
     }
 }
 static int getError(void* context,char* buffer,int size) {
@@ -503,7 +599,16 @@ static int getParam(void* context,const char* key,char* buffer,int size) {
     if(!strcmp(key,"part_volume")) return snprintf(buffer,size,"%d",s->partVolume[std::clamp(s->part.load(),1,MultiParts)-1].load());
     // The LIVE name, off the device's own display -- so a ROM whose sounds
     // differ from the compiled-in table still reports the truth.
-    if(!strcmp(key,"preset_name")) return snprintf(buffer,size,"%s",s->lcdName);
+    if(!strcmp(key,"multi_ready")) return snprintf(buffer,size,"%d",s->multiReady.load());
+    if(!strcmp(key,"writes")) return snprintf(buffer,size,"preset=<%s> mode=<%s> parsed_preset=%d parsed_mode=%d",
+        s->lastPresetWrite,s->lastModeWrite,s->preset.load(),s->multiMode.load());
+    // The name of what is SELECTED, from the compiled-in table. It used to come
+    // off the front panel, which is right in Single mode and wrong in Multi --
+    // there row 2 shows the MULTI's name ("From TUS with <3"), so the name
+    // froze while the sound changed, which reads as "presets do nothing".
+    if(!strcmp(key,"preset_name"))
+        return snprintf(buffer,size,"%s",vavra::g_presetNames[std::clamp(s->preset.load(),0,BankCount*PresetsPerBank-1)]);
+    if(!strcmp(key,"lcd_name")) return snprintf(buffer,size,"%s",s->lcdName);
     if(!strcmp(key,"stalls")) {
         int used=0;
         used+=snprintf(buffer+used,size-used,"warm_stalls=%u",s->warmStalls.load());

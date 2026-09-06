@@ -8,6 +8,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <thread>
+#include <vector>
 #ifdef __linux__
 #include <sched.h>
 #include <unistd.h>
@@ -118,16 +119,22 @@ int main(int argc, char** argv) {
     printf("settle_done t=%.3f\n",seconds(start)); fflush(stdout);
     if(program) {
         // bank:preset through the module's own params, 1-based like the device.
-        int bank=0,pgm=1;
-        if(sscanf(program,"%d:%d",&bank,&pgm)!=2) { bank=0; pgm=atoi(program); }
-        char text[16];
-        snprintf(text,sizeof(text),"%d",bank); api->set_param(inst,"bank",text);
-        snprintf(text,sizeof(text),"%d",pgm);  api->set_param(inst,"preset",text);
-        printf("program=%d:%d\n",bank,pgm);
+        // "label:<text>" writes the option LABEL instead of the index, which
+        // is how some callers address an enum.
+        if(!strncmp(program,"label:",6)) {
+            api->set_param(inst,"preset",program+6);
+            printf("program=label %s\n",program+6);
+        } else {
+            char text[16];
+            snprintf(text,sizeof(text),"%d",atoi(program));
+            api->set_param(inst,"preset",text);
+            printf("program=index %s\n",text);
+        }
         // The firmware needs time to swap the edit buffer before it is played.
         for(int i=0;i<172;++i) { api->render_block(inst,audio,128);
             std::this_thread::sleep_for(std::chrono::microseconds(2902)); }
         if(api->get_param(inst,"preset_name",value,sizeof(value))>0) printf("preset_name=%s\n",value);
+        if(api->get_param(inst,"writes",value,sizeof(value))>0) printf("writes: %s\n",value);
         // Loading a patch stalls the emulator briefly -- new firmware work and
         // new JIT paths. That is a click when you change sound, not a synth
         // that cannot hold a note, so it is counted on its own and the
@@ -157,27 +164,95 @@ int main(int argc, char** argv) {
         printf("multi part=%d channel=%d name=%s\n",part,channel,value);
         seen=underrunsOf(api,inst);
     }
+    // Env-driven scenario for the correctness battery:
+    //   VAVRA_MODE=single|multi  VAVRA_PRESET=<idx>
+    //   VAVRA_PART1=<idx> VAVRA_PART2=<idx> VAVRA_PART2_VOL=<0..127>
+    //   VAVRA_PLAY_CH=<1..16>   VAVRA_WAV=<path>
+    if(const char* scenarioMode=getenv("VAVRA_MODE")) {
+        char text[32];
+        auto envInt=[&](const char* name,int fallback){ const char* v=getenv(name); return v&&*v ? atoi(v) : fallback; };
+        auto setPart=[&](int part,int presetIndex,int channel,int volume){
+            snprintf(text,sizeof(text),"%d",part);        api->set_param(inst,"part",text);
+            snprintf(text,sizeof(text),"%d",channel);     api->set_param(inst,"part_channel",text);
+            snprintf(text,sizeof(text),"%d",volume);      api->set_param(inst,"part_volume",text);
+            snprintf(text,sizeof(text),"%d",presetIndex); api->set_param(inst,"preset",text);
+        };
+        const bool multi=!strcmp(scenarioMode,"multi");
+        api->set_param(inst,"mode",multi?"1":"0");
+        if(multi) {
+            setPart(1,envInt("VAVRA_PART1",0),1,127);
+            setPart(2,envInt("VAVRA_PART2",16),envInt("VAVRA_PART2_CH",2),envInt("VAVRA_PART2_VOL",127));
+        } else {
+            snprintf(text,sizeof(text),"%d",envInt("VAVRA_PRESET",0));
+            api->set_param(inst,"preset",text);
+        }
+        noteChannel=std::clamp(envInt("VAVRA_PLAY_CH",1),1,16)-1;
+        // Let every write land and the patch changes settle before playing.
+        for(int i=0;i<1035;++i) { api->render_block(inst,audio,128);
+            std::this_thread::sleep_for(std::chrono::microseconds(2902)); }
+        api->get_param(inst,"preset_name",value,sizeof(value));
+        printf("scenario mode=%s play_ch=%d name=%s\n",scenarioMode,noteChannel+1,value);
+        // What the DEVICE says is loaded, off its own display -- the selected
+        // name now comes from the table, so only this can catch a selection
+        // that never reached the firmware.
+        if(api->get_param(inst,"lcd_name",value,sizeof(value))>0) printf("scenario lcd=<%s>\n",value);
+        api->get_param(inst,"multi_ready",value,sizeof(value));
+        printf("scenario multi_ready=%s\n",value);
+        seen=underrunsOf(api,inst);
+    }
     const int notes[]={60,64,67,72,76,79,84,88};
     const int voices=argc>3 ? std::clamp(atoi(argv[3]),1,8) : 4;
     for(int i=0;i<voices;++i) { uint8_t msg[]={(uint8_t)(0x90|noteChannel),(uint8_t)notes[i],100}; api->on_midi(inst,msg,3,0); }
+    // "sweep" changes the preset every second while notes are held, which is
+    // the gesture a user makes on the knob. A module-side bug where only the
+    // first write lands shows up here as a flat rms.
+    const bool sweep = (argc>6 && !strcmp(argv[6],"sweep")) || (argc>7 && !strcmp(argv[7],"sweep"));
+    // VAVRA_HOLD: one attack, then hold -- so a capture can be compared with an
+    // offline render of a held chord without the retriggers being the
+    // difference between them.
+    const bool hold = getenv("VAVRA_HOLD") != nullptr;
+    const int sweepPresets[]={0,16,100,200,299};
+    double windowSum=0; long windowCount=0; int windowIndex=0;
+    // VAVRA_WAV captures exactly what render_block hands the host, so the
+    // module's real path (fork, ring, gain, int16) can be compared against a
+    // direct offline render of the same engine.
+    const char* wavPath=getenv("VAVRA_WAV");
+    std::vector<int16_t> capture;
+    if(wavPath) capture.reserve(3446*256);
     double sum=0,maxRender=0; int peak=0; long count=0;
     auto next=Clock::now();
     for(int block=0;block<3446;++block) {
         if(block>0 && block%345==0) {
-            api->get_param(inst,"diagnostics",value,sizeof(value));
-            printf("second=%d %s\n",block/345,value); fflush(stdout);
+            if(sweep) {
+                api->get_param(inst,"preset_name",value,sizeof(value));
+                printf("second=%d preset=%d name=%-18s rms=%.1f\n",block/345,
+                       sweepPresets[windowIndex%5],value,
+                       windowCount?sqrt(windowSum/windowCount):0.0);
+                windowSum=0; windowCount=0;
+                ++windowIndex;
+                char text[16]; snprintf(text,sizeof(text),"%d",sweepPresets[windowIndex%5]);
+                api->set_param(inst,"preset",text);
+            } else {
+                api->get_param(inst,"diagnostics",value,sizeof(value));
+                printf("second=%d %s\n",block/345,value);
+            }
+            fflush(stdout);
         }
-        if(block>0 && block%345==0) {
+        if(block>0 && block%345==0 && !sweep && !hold) {
             for(int i=0;i<voices;++i) { uint8_t msg[]={(uint8_t)(0x80|noteChannel),(uint8_t)notes[i],0}; api->on_midi(inst,msg,3,0); }
         }
-        if(block>0 && block%345==10) {
+        if(block>0 && block%345==10 && !hold) {
+            // A held note does not re-voice on a patch change; retrigger so the
+            // new sound is actually heard, as it would be when you play again.
             for(int i=0;i<voices;++i) { uint8_t msg[]={(uint8_t)(0x90|noteChannel),(uint8_t)notes[i],100}; api->on_midi(inst,msg,3,0); }
         }
         auto render=Clock::now(); api->render_block(inst,audio,128);
         maxRender=std::max(maxRender,seconds(render));
         int now=underrunsOf(api,inst);
         if(now!=seen) { printf("play_block=%d underruns=%d t=%.3f\n",block,now,seconds(start)); fflush(stdout); seen=now; }
-        for(int16_t sample:audio) { peak=std::max(peak,abs((int)sample)); sum+=double(sample)*sample; ++count; }
+        for(int16_t sample:audio) { peak=std::max(peak,abs((int)sample)); sum+=double(sample)*sample; ++count;
+            windowSum+=double(sample)*sample; ++windowCount; }
+        if(wavPath) capture.insert(capture.end(),audio,audio+256);
         next+=std::chrono::nanoseconds(2902494);
         std::this_thread::sleep_until(next);
     }
@@ -188,6 +263,19 @@ int main(int argc, char** argv) {
     const int playUnderruns=underruns-underrunsBeforeNotes;
     printf("voices=%d peak=%d rms=%.2f max_render_us=%.1f play_underruns=%d %s\n",
            voices,peak,sqrt(sum/count),maxRender*1e6,playUnderruns,value);
+    if(wavPath && !capture.empty()) {
+        if(FILE* wav=fopen(wavPath,"wb")) {
+            const uint32_t dataBytes=(uint32_t)(capture.size()*2);
+            auto put32=[&](uint32_t v){ fwrite(&v,4,1,wav); };
+            auto put16=[&](uint16_t v){ fwrite(&v,2,1,wav); };
+            fwrite("RIFF",1,4,wav); put32(36+dataBytes); fwrite("WAVEfmt ",1,8,wav);
+            put32(16); put16(1); put16(2); put32(44100); put32(44100*4); put16(4); put16(16);
+            fwrite("data",1,4,wav); put32(dataBytes);
+            fwrite(capture.data(),2,capture.size(),wav);
+            fclose(wav);
+            printf("wrote %s (%zu frames)\n",wavPath,capture.size()/2);
+        }
+    }
     if(api->get_param(inst,"stalls",value,sizeof(value))>0) printf("%s\n",value);
     start=Clock::now(); api->destroy_instance(inst);
     printf("destroy_seconds=%.6f\n",seconds(start));

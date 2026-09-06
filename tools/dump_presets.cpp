@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
                 midiIn.clear();
                 if(!into) continue;
                 for(int i = 0; i < Chunk; ++i) {
-                    for(int channel = 0; channel < 2; ++channel) {
+                    for(int channel = 0; channel < 4; ++channel) {
                         float sample = output[channel][i] * 32767.0f;
                         sample = std::max(-32768.0f, std::min(32767.0f, sample));
                         into->push_back(static_cast<int16_t>(sample));
@@ -162,8 +162,13 @@ int main(int argc, char** argv) {
         const uint8_t notes[] = {60, 64, 67, 72, 76, 79, 84, 88};
         for(int i = 0; i < std::min(voices, 8); ++i)
             midiIn.emplace_back(synthLib::MidiEventSource::Host, 0x90, notes[i], 100);
+        // Hold long enough that a fixed note-on-aligned window can be compared
+        // with a module capture of the same material: "loudest 1 s of each"
+        // compares different phases of an evolving patch and calls them
+        // different sounds.
+        const int holdSeconds = argc > 7 ? atoi(argv[7]) : 6;
         std::vector<int16_t> pcm;
-        spin(1400, &pcm);
+        spin(holdSeconds * 44100 / Chunk, &pcm);
         for(int i = 0; i < std::min(voices, 8); ++i)
             midiIn.emplace_back(synthLib::MidiEventSource::Host, 0x80, notes[i], 0);
         spin(700, &pcm);
@@ -180,6 +185,243 @@ int main(int argc, char** argv) {
         fclose(wav);
         fprintf(out, "wrote %s: clock=%d%% preset=%d voices=%d frames=%zu\n",
                 wavPath, clockPercent, preset, voices, pcm.size() / 2);
+        return 0;
+    }
+    // "verify": after selecting a preset by Bank Select + Program Change, ask
+    // the firmware for its EDIT BUFFER single and read the name out of the
+    // dump. The bank request goes unanswered and the panel's name row is not
+    // persistent, so this is the only authority for "what is actually loaded".
+    if(argc > 2 && !strcmp(argv[2], "verify")) {
+        constexpr uint8_t Waldorf = 0x3e, MicroQ = 0x10, Omni = 0x7f;
+        auto spin = [&](int blocks, std::string* name) {
+            for(int block = 0; block < blocks && (!name || name->empty()); ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+                if(!name) continue;
+                for(const auto& reply : midiOut) {
+                    const auto& sysex = reply.sysex;
+                    if(sysex.size() < mqLib::mq::g_singleNameOffset + mqLib::mq::g_singleNameLength) continue;
+                    if(sysex[4] != static_cast<uint8_t>(mqLib::SysexCommand::SingleDump)) continue;
+                    name->assign(sysex.begin() + mqLib::mq::g_singleNameOffset,
+                                 sysex.begin() + mqLib::mq::g_singleNameOffset + mqLib::mq::g_singleNameLength);
+                    while(!name->empty() && name->back() == ' ') name->pop_back();
+                }
+            }
+        };
+        for(int i = 3; i < argc; ++i) {
+            const int preset = atoi(argv[i]);
+            midiIn.emplace_back(synthLib::MidiEventSource::Host, 0xb0, 32, static_cast<uint8_t>(preset / 100));
+            midiIn.emplace_back(synthLib::MidiEventSource::Host, 0xc0, static_cast<uint8_t>(preset % 100), 0);
+            spin(600, nullptr);
+            synthLib::SMidiEvent request(synthLib::MidiEventSource::Host);
+            request.sysex = {0xf0, Waldorf, MicroQ, Omni,
+                             static_cast<uint8_t>(mqLib::SysexCommand::SingleRequest),
+                             static_cast<uint8_t>(mqLib::MidiBufferNum::SingleEditBufferSingleMode),
+                             static_cast<uint8_t>(mqLib::MidiSoundLocation::EditBufferCurrentSingle), 0xf7};
+            midiIn.clear(); midiIn.push_back(request);
+            std::string name;
+            spin(2000, &name);
+            fprintf(out, "preset %3d -> edit buffer name <%s>\n", preset, name.empty() ? "NO REPLY" : name.c_str());
+            fflush(out);
+        }
+        return 0;
+    }
+    // "multiwrite <p1> <p2>": do exactly what the plugin does -- Multi mode,
+    // then MultiParameterChange writes for each part's sound bank and number --
+    // then read the Multi back and print where the values actually landed.
+    if(argc > 2 && !strcmp(argv[2], "multiwrite")) {
+        constexpr uint8_t Waldorf = 0x3e, MicroQ = 0x10, Omni = 0x7f;
+        constexpr int Stride = 22;
+        // Four distinct sounds across four parts, so the channel -> instrument
+        // mapping can be read straight off which sound answers where.
+        const int wanted[4] = { argc > 3 ? atoi(argv[3]) : 0,   argc > 4 ? atoi(argv[4]) : 100,
+                                argc > 6 ? atoi(argv[6]) : 200, argc > 7 ? atoi(argv[7]) : 299 };
+        const int p1 = wanted[0], p2 = wanted[1];
+        auto spin = [&](int blocks) {
+            for(int block = 0; block < blocks; ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+            }
+        };
+        auto write = [&](uint8_t command, int index, uint8_t value) {
+            synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
+            event.sysex = {0xf0, Waldorf, MicroQ, Omni, command,
+                           static_cast<uint8_t>(index >> 7), static_cast<uint8_t>(index & 0x7f),
+                           value, 0xf7};
+            midiIn.push_back(event);
+        };
+        write(static_cast<uint8_t>(mqLib::SysexCommand::GlobalParameterChange),
+              static_cast<int>(mqLib::GlobalParameter::SingleMultiMode), 1);
+        spin(600);
+        for(int part = 0; part < 4; ++part) {
+            const int preset = wanted[part];
+            const int base = static_cast<int>(mqLib::MultiParameter::Inst0) + part * Stride;
+            write(static_cast<uint8_t>(mqLib::SysexCommand::MultiParameterChange), base + 0,
+                  static_cast<uint8_t>(preset / 100));
+            write(static_cast<uint8_t>(mqLib::SysexCommand::MultiParameterChange), base + 1,
+                  static_cast<uint8_t>(preset % 100));
+            spin(300);
+        }
+        spin(600);
+        std::vector<uint8_t> multi;
+        {
+            synthLib::SMidiEvent request(synthLib::MidiEventSource::Host);
+            request.sysex = {0xf0, Waldorf, MicroQ, Omni,
+                             static_cast<uint8_t>(mqLib::SysexCommand::MultiRequest),
+                             static_cast<uint8_t>(mqLib::MidiBufferNum::MultiEditBuffer), 0x00, 0xf7};
+            midiIn.clear(); midiIn.push_back(request);
+            for(int block = 0; block < 2000 && multi.empty(); ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+                for(const auto& reply : midiOut)
+                    if(reply.sysex.size() > 8 &&
+                       reply.sysex[4] == static_cast<uint8_t>(mqLib::SysexCommand::MultiDump))
+                        multi.assign(reply.sysex.begin(), reply.sysex.end());
+            }
+        }
+        // Then PLAY each channel and write a WAV, so "the data is right" and
+        // "the right sound comes out" are two separate measurements.
+        if(argc > 5) {
+            for(int channel = 0; channel < 4; ++channel) {
+                const uint8_t notes[] = {60, 64};
+                for(uint8_t note : notes)
+                    midiIn.emplace_back(synthLib::MidiEventSource::Host,
+                        static_cast<uint8_t>(0x90 | channel), note, 100);
+                std::vector<int16_t> pcm;
+                for(int block = 0; block < 6*44100/Chunk; ++block) {
+                    midiOut.clear();
+                    static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                    midiIn.clear();
+                    for(int i = 0; i < Chunk; ++i)
+                        for(int c = 0; c < 2; ++c) {
+                            float v = output[c][i] * 32767.0f;
+                            pcm.push_back(static_cast<int16_t>(std::max(-32768.0f, std::min(32767.0f, v))));
+                        }
+                }
+                for(uint8_t note : notes)
+                    midiIn.emplace_back(synthLib::MidiEventSource::Host,
+                        static_cast<uint8_t>(0x80 | channel), note, 0);
+                spin(600);
+                char path[512];
+                snprintf(path, sizeof(path), "%s_ch%d.wav", argv[5], channel + 1);
+                if(FILE* wav = fopen(path, "wb")) {
+                    const uint32_t dataBytes = (uint32_t)(pcm.size()*2);
+                    auto put32=[&](uint32_t v){ fwrite(&v,4,1,wav); };
+                    auto put16=[&](uint16_t v){ fwrite(&v,2,1,wav); };
+                    fwrite("RIFF",1,4,wav); put32(36+dataBytes); fwrite("WAVEfmt ",1,8,wav);
+                    put32(16); put16(1); put16(2); put32(44100); put32(44100*4); put16(4); put16(16);
+                    fwrite("data",1,4,wav); put32(dataBytes);
+                    fwrite(pcm.data(),2,pcm.size(),wav); fclose(wav);
+                    fprintf(out, "  played ch%d -> %s\n", channel + 1, path);
+                }
+            }
+        }
+        fprintf(out, "wrote part1=%d (bank %d num %d), part2=%d (bank %d num %d)\n",
+                p1, p1/100, p1%100, p2, p2/100, p2%100);
+        if(multi.empty()) { fprintf(out, "no Multi dump came back\n"); return 1; }
+        for(int part = 0; part < 4; ++part) {
+            const int base = mqLib::IdxMultiParamFirst + static_cast<int>(mqLib::MultiParameter::Inst0) + part * Stride;
+            fprintf(out, "  read back inst%d: bank=%d num=%d channel=%d volume=%d\n", part + 1,
+                    multi[base + 0], multi[base + 1], multi[base + 2], multi[base + 3]);
+        }
+        return 0;
+    }
+    // "multisend <prefix> <p1> <p2> <p3> <p4>": assign the parts by editing the
+    // WHOLE Multi and sending it back as a MultiDump, rather than by writing
+    // individual instrument parameters -- which changes the multi's data
+    // without the parts loading the sounds.
+    if(argc > 2 && !strcmp(argv[2], "multisend")) {
+        constexpr uint8_t Waldorf = 0x3e, MicroQ = 0x10, Omni = 0x7f;
+        constexpr int Stride = 22, MultiDataBytes = 384;
+        const int wanted[4] = { argc > 4 ? atoi(argv[4]) : 0,   argc > 5 ? atoi(argv[5]) : 100,
+                                argc > 6 ? atoi(argv[6]) : 200, argc > 7 ? atoi(argv[7]) : 299 };
+        auto spin = [&](int blocks) {
+            for(int block = 0; block < blocks; ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+            }
+        };
+        {   synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
+            const auto param = static_cast<uint8_t>(mqLib::GlobalParameter::SingleMultiMode);
+            event.sysex = {0xf0, Waldorf, MicroQ, Omni,
+                static_cast<uint8_t>(mqLib::SysexCommand::GlobalParameterChange),
+                static_cast<uint8_t>(param >> 7), static_cast<uint8_t>(param & 0x7f), 1, 0xf7};
+            midiIn.clear(); midiIn.push_back(event); spin(600); }
+
+        std::vector<uint8_t> multi;
+        {   synthLib::SMidiEvent request(synthLib::MidiEventSource::Host);
+            request.sysex = {0xf0, Waldorf, MicroQ, Omni,
+                static_cast<uint8_t>(mqLib::SysexCommand::MultiRequest),
+                static_cast<uint8_t>(mqLib::MidiBufferNum::MultiEditBuffer), 0x00, 0xf7};
+            midiIn.clear(); midiIn.push_back(request);
+            for(int block = 0; block < 2000 && multi.empty(); ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+                for(const auto& reply : midiOut)
+                    if(reply.sysex.size() > 8 &&
+                       reply.sysex[4] == static_cast<uint8_t>(mqLib::SysexCommand::MultiDump))
+                        multi.assign(reply.sysex.begin(), reply.sysex.end());
+            }
+        }
+        if(multi.size() < mqLib::IdxMultiParamFirst + MultiDataBytes) {
+            fprintf(out, "no usable Multi dump (%zu bytes)\n", multi.size()); return 1; }
+
+        std::vector<uint8_t> data(multi.begin() + mqLib::IdxMultiParamFirst,
+                                  multi.begin() + mqLib::IdxMultiParamFirst + MultiDataBytes);
+        for(int part = 0; part < 4; ++part) {
+            const int base = static_cast<int>(mqLib::MultiParameter::Inst0) + part * Stride;
+            data[base + 0] = static_cast<uint8_t>(wanted[part] / 100);
+            data[base + 1] = static_cast<uint8_t>(wanted[part] % 100);
+        }
+        {   synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
+            std::vector<uint8_t> sysex = {0xf0, Waldorf, MicroQ, Omni,
+                static_cast<uint8_t>(mqLib::SysexCommand::MultiDump),
+                static_cast<uint8_t>(mqLib::MidiBufferNum::DeprecatedMultiBankInternal), 0};
+            sysex.insert(sysex.end(), data.begin(), data.end());
+            uint8_t checksum = 0;
+            for(size_t i = 4; i < sysex.size(); ++i) checksum += sysex[i];
+            sysex.push_back(checksum & 0x7f);
+            sysex.push_back(0xf7);
+            event.sysex.assign(sysex.begin(), sysex.end());
+            midiIn.clear(); midiIn.push_back(event); spin(1200); }
+
+        for(int channel = 0; channel < 4; ++channel) {
+            const uint8_t notes[] = {60, 64};
+            for(uint8_t note : notes)
+                midiIn.emplace_back(synthLib::MidiEventSource::Host,
+                    static_cast<uint8_t>(0x90 | channel), note, 100);
+            std::vector<int16_t> pcm;
+            for(int block = 0; block < 6*44100/Chunk; ++block) {
+                midiOut.clear();
+                static_cast<synthLib::Device&>(device).process(inputs, outputs, Chunk, midiIn, midiOut);
+                midiIn.clear();
+                for(int i = 0; i < Chunk; ++i)
+                    for(int c = 0; c < 2; ++c) {
+                        float v = output[c][i] * 32767.0f;
+                        pcm.push_back(static_cast<int16_t>(std::max(-32768.0f, std::min(32767.0f, v))));
+                    }
+            }
+            for(uint8_t note : notes)
+                midiIn.emplace_back(synthLib::MidiEventSource::Host,
+                    static_cast<uint8_t>(0x80 | channel), note, 0);
+            spin(600);
+            char path[512]; snprintf(path, sizeof(path), "%s_ch%d.wav", argv[3], channel + 1);
+            if(FILE* wav = fopen(path, "wb")) {
+                const uint32_t dataBytes = (uint32_t)(pcm.size()*2);
+                auto put32=[&](uint32_t v){ fwrite(&v,4,1,wav); };
+                auto put16=[&](uint16_t v){ fwrite(&v,2,1,wav); };
+                fwrite("RIFF",1,4,wav); put32(36+dataBytes); fwrite("WAVEfmt ",1,8,wav);
+                put32(16); put16(1); put16(2); put32(44100); put32(44100*4); put16(4); put16(16);
+                fwrite("data",1,4,wav); put32(dataBytes);
+                fwrite(pcm.data(),2,pcm.size(),wav); fclose(wav);
+                fprintf(out, "  ch%d -> %s\n", channel + 1, path);
+            }
+        }
         return 0;
     }
     // "multi": switch the firmware to Multi mode and play one channel at a

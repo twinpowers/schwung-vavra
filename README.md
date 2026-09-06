@@ -8,6 +8,39 @@ runs the microQ's 16-part Multi. At the default 50% DSP clock every cell
 measured zero underruns, including eight voices across two parts. No state
 save/restore and no editable patch parameters yet -- see [Next](#next).
 
+## Verifying the audio
+
+`tests/audio_battery.sh` captures what `render_block` actually hands the host
+and scores it against an offline render of the same engine driven directly --
+no fork, no ring, no gain. Every capture must match its OWN reference and beat
+every other by 2x. Current result: 5/5 presets in Single, 4/4 parts in Multi,
+plus part-volume and layering.
+
+| check | self | nearest other |
+|---|---|---|
+| Single, five presets | 1.26 - 2.92 | 15.5 - 33.2 |
+| Multi, four part/channel pairs | 2.92 - 4.31 | 12.1 - 33.3 |
+| part volume 0 | 0.05% of its audible level | |
+| two parts on one channel | +63% rms, both sounds present | |
+
+**Identity is spectral, not sample-exact, and that is forced.** `mqLib` runs the
+68k in `m_ucThread` and the DSP in a `DSPThread`, so the emulator is not
+reproducible against itself: two renders of one preset differ by 1.4-5.0 on this
+metric. Any comparison needs that same-preset control, or it is measuring
+thread scheduling.
+
+Two ways this test lied before it was right, both worth keeping in mind:
+
+- **Compare the same material.** Scoring the "loudest 1 s" of a 10 s capture
+  against the "loudest 1 s" of a 3 s render compares different phases of an
+  evolving patch and calls them different sounds -- 2 of 5 presets failed that
+  way. Both files start at note-on, so a FIXED window at the same offset is the
+  fair comparison.
+- **A retriggering capture is not a held one.** Note-off/on clicks every second
+  spread broadband low-frequency energy, which swamps the quiet bands of a
+  spectrally clean patch: the init sound then matched the wrong reference by
+  30+ dB in bands where its own reference sits at -75 dB.
+
 ## Multi mode
 
 The firmware boots in **SINGLE mode on omni**: one sound, every channel, which
@@ -24,8 +57,23 @@ Verified by playing one channel at a time:
 | Multi | 3696 | 480 | 684 | 666 |
 
 `part` selects which part the `part_*` keys address; it writes nothing to the
-firmware. In Multi mode `preset` sets that part's sound (a Program Change
-would retarget whatever the front panel has selected instead).
+firmware. In Multi mode `preset` sets that part's sound.
+
+**A part is assigned by sending the WHOLE Multi, not by writing its fields.**
+`MultiParameterChange` on `Inst<n>SoundBank`/`SoundNumber` updates the Multi's
+data -- reading it back confirms the bytes land exactly where intended -- and
+the parts still do not load those sounds: measured, MIDI channel 1 then played
+instrument 4's patch. mqLib's own `createInitState` does not use parameter
+changes either. So the module fetches the Multi at boot, edits it, and sends it
+back as one dump, **debounced 300 ms** -- sending it in the same block as the
+Single/Multi mode change leaves every part edit with no effect.
+
+Two more things that bite in a chain slot: a slot forwards ONE MIDI channel, so
+with the default layout (part n on channel n) only part 1 sounds -- set several
+parts to the same `part_channel` to layer them. And `preset_name` reports the
+SELECTED name from the table rather than the front panel, because in Multi the
+panel's second row shows the MULTI's name ("From TUS with <3") and freezes
+while the sound changes, which reads as "presets do nothing".
 
 ## Presets
 

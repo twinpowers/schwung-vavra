@@ -8,6 +8,34 @@ name, and runs the 16-part Multi. Every cell at the default 50% DSP clock
 measured zero underruns, including eight voices across two parts. No state
 save/restore and no patch parameters yet.
 
+## Verify audio with tests/audio_battery.sh, and mind how it lies
+
+It captures `render_block`'s own output and scores it against an offline render
+of the same engine (no fork, ring or gain): every capture must match its OWN
+reference and beat every other by 2x. Currently 5/5 Single, 4/4 Multi, plus
+part volume and layering. **Spectral, not sample-exact** -- the emulator is not
+reproducible against itself (two renders of one preset differ 1.4-5.0), so the
+same-preset control is the yardstick.
+
+It reported failures twice for reasons that were NOT the module: comparing the
+"loudest window" of each file, which lines up different phases of an evolving
+patch (use a fixed note-on-aligned window); and comparing a retriggering
+capture against a held render, whose note-on clicks swamp the quiet bands of a
+clean patch by 30 dB.
+
+## A part is assigned by sending the WHOLE Multi
+
+`MultiParameterChange` on `Inst<n>SoundBank`/`SoundNumber` writes the Multi's
+data correctly -- a read-back proves the bytes land where intended -- and the
+parts do not load those sounds; MIDI channel 1 then played instrument 4's
+patch. mqLib's `createInitState` sends a whole Multi too. The module fetches
+the Multi at boot, edits it and sends it back as one dump, **debounced 300 ms**:
+sent in the same block as the mode change, every part edit is a no-op.
+
+**A part key must capture the part at WRITE time.** `preset` used to raise a
+pending flag and let the child resolve `part` when it drained, so selecting a
+sound for part 1 and then moving to part 2 landed BOTH on part 2.
+
 ## The firmware boots SINGLE + omni, which reads as "the channel does nothing"
 
 One sound on every channel. `mode` switches to Multi, where the 16 parts each
