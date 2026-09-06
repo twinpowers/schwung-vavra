@@ -1,0 +1,36 @@
+{
+    "id": "vavra",
+    "name": "Vavra",
+    "abbrev": "MQ",
+    "version": "0.0.1",
+    "description": "Waldorf microQ emulator (Gearmulator)",
+    "author": "dsp56300/gearmulator (port: charlesvestal)",
+    "ui": "ui.js",
+    "dsp": "dsp.so",
+    "api_version": 2,
+    "assets": {
+        "path": "roms",
+        "label": "ROMs",
+        "extensions": [".bin", ".BIN", ".mid"],
+        "description": "Requires a microQ OS 2.23 firmware image: one 512 KB .bin, or a 300-400 KB .mid OS update.",
+        "hint": "Some EPROM dumps are byte-swapped within each 16-bit word and are rejected; the image must begin with the ASCII '2.23'.",
+        "files": [
+            {
+                "filename": "microq223.bin",
+                "label": "microQ OS 2.23 firmware",
+                "size": 524288,
+                "required": true
+            }
+        ]
+    },
+    "capabilities": {
+        "audio_out": true,
+        "audio_in": false,
+        "midi_in": true,
+        "midi_out": false,
+        "default_forward_channel": 1,
+        "chainable": true,
+        "component_type": "sound_generator"
+    },
+    "chain_params": []
+}
