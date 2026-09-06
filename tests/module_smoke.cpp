@@ -75,7 +75,10 @@ int main(int argc, char** argv) {
     if(const char* path=getenv("VAVRA_DUMP_CONTRACT")) {
         if(FILE* f=fopen(path,"w")) { fwrite(contract,1,contractLen,f); fclose(f); }
     }
-    if(argc>2) api->set_param(inst,"dsp_clock",argv[2]);
+    // "-" (or empty) leaves the module's own default in place. atoi("") is 0,
+    // which the module clamps to its MINIMUM -- so passing a placeholder here
+    // silently measured 25% and called it the default.
+    if(argc>2 && argv[2][0] && strcmp(argv[2],"-")) api->set_param(inst,"dsp_clock",argv[2]);
     if(argc>4) api->set_param(inst,"buffer_ms",argv[4]);
     // argv[5]: bank:program, sent as Bank Select MSB + Program Change once the
     // emulator is ready, to find out whether the ROM presets are reachable
@@ -134,9 +137,29 @@ int main(int argc, char** argv) {
         printf("preset_change_underruns=%d\n",changeUnderruns);
     }
     const int underrunsBeforeNotes=seen;
+    // argv[6] "multi:<part>:<channel>" switches the firmware to Multi mode,
+    // points the part keys at <part>, puts that part on <channel>, and plays
+    // the notes there -- the whole multitimbral path through the module's own
+    // parameters rather than through a probe.
+    int noteChannel=0;
+    if(argc>6 && !strncmp(argv[6],"multi:",6)) {
+        int part=1,channel=1;
+        sscanf(argv[6]+6,"%d:%d",&part,&channel);
+        char text[16];
+        api->set_param(inst,"mode","1");
+        snprintf(text,sizeof(text),"%d",part);    api->set_param(inst,"part",text);
+        snprintf(text,sizeof(text),"%d",channel); api->set_param(inst,"part_channel",text);
+        if(program) { snprintf(text,sizeof(text),"%d",atoi(program)); api->set_param(inst,"preset",text); }
+        noteChannel=std::clamp(channel,1,16)-1;
+        for(int i=0;i<690;++i) { api->render_block(inst,audio,128);
+            std::this_thread::sleep_for(std::chrono::microseconds(2902)); }
+        api->get_param(inst,"preset_name",value,sizeof(value));
+        printf("multi part=%d channel=%d name=%s\n",part,channel,value);
+        seen=underrunsOf(api,inst);
+    }
     const int notes[]={60,64,67,72,76,79,84,88};
     const int voices=argc>3 ? std::clamp(atoi(argv[3]),1,8) : 4;
-    for(int i=0;i<voices;++i) { uint8_t msg[]={0x90,(uint8_t)notes[i],100}; api->on_midi(inst,msg,3,0); }
+    for(int i=0;i<voices;++i) { uint8_t msg[]={(uint8_t)(0x90|noteChannel),(uint8_t)notes[i],100}; api->on_midi(inst,msg,3,0); }
     double sum=0,maxRender=0; int peak=0; long count=0;
     auto next=Clock::now();
     for(int block=0;block<3446;++block) {
@@ -145,10 +168,10 @@ int main(int argc, char** argv) {
             printf("second=%d %s\n",block/345,value); fflush(stdout);
         }
         if(block>0 && block%345==0) {
-            for(int i=0;i<voices;++i) { uint8_t msg[]={0x80,(uint8_t)notes[i],0}; api->on_midi(inst,msg,3,0); }
+            for(int i=0;i<voices;++i) { uint8_t msg[]={(uint8_t)(0x80|noteChannel),(uint8_t)notes[i],0}; api->on_midi(inst,msg,3,0); }
         }
         if(block>0 && block%345==10) {
-            for(int i=0;i<voices;++i) { uint8_t msg[]={0x90,(uint8_t)notes[i],100}; api->on_midi(inst,msg,3,0); }
+            for(int i=0;i<voices;++i) { uint8_t msg[]={(uint8_t)(0x90|noteChannel),(uint8_t)notes[i],100}; api->on_midi(inst,msg,3,0); }
         }
         auto render=Clock::now(); api->render_block(inst,audio,128);
         maxRender=std::max(maxRender,seconds(render));
@@ -158,7 +181,7 @@ int main(int argc, char** argv) {
         next+=std::chrono::nanoseconds(2902494);
         std::this_thread::sleep_until(next);
     }
-    for(int i=0;i<voices;++i) { uint8_t msg[]={0x80,(uint8_t)notes[i],0}; api->on_midi(inst,msg,3,0); }
+    for(int i=0;i<voices;++i) { uint8_t msg[]={(uint8_t)(0x80|noteChannel),(uint8_t)notes[i],0}; api->on_midi(inst,msg,3,0); }
     api->get_param(inst,"diagnostics",value,sizeof(value));
     const char* underrunField=strstr(value,"underruns=");
     const int underruns=underrunField ? atoi(underrunField+10) : -1;

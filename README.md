@@ -2,11 +2,30 @@
 
 Waldorf microQ for Schwung/Move, on gearmulator's `mqLib`.
 
-**Status: playable, measured on Move.** The module builds, boots the firmware,
-plays, and selects any of the 300 factory sounds by name. Four and eight voices
-at the default 75% DSP clock each ran 10 s with zero underruns, worst-case
-`render_block` 26 us. No state save/restore and no editable patch parameters
-yet -- see [Next](#next).
+**Status: playable and multitimbral, measured on Move.** The module builds,
+boots the firmware, plays, selects any of the 300 factory sounds by name, and
+runs the microQ's 16-part Multi. At the default 50% DSP clock every cell
+measured zero underruns, including eight voices across two parts. No state
+save/restore and no editable patch parameters yet -- see [Next](#next).
+
+## Multi mode
+
+The firmware boots in **SINGLE mode on omni**: one sound, every channel, which
+is why a slot's forward channel appears to do nothing. `mode` switches it to
+Multi, where the 16 parts each have their own sound, MIDI channel and volume --
+part n on channel n by default. Point several parts at the SAME channel to
+layer them, or use the key ranges for a split.
+
+Verified by playing one channel at a time:
+
+| | ch1 | ch2 | ch3 | ch4 |
+|---|---|---|---|---|
+| Single | rms 3679 | 3479 | 3410 | 3484 |
+| Multi | 3696 | 480 | 684 | 666 |
+
+`part` selects which part the `part_*` keys address; it writes nothing to the
+firmware. In Multi mode `preset` sets that part's sound (a Program Change
+would retarget whatever the front panel has selected instead).
 
 ## Presets
 
@@ -63,11 +82,35 @@ the microQ burns ~16 CPU-seconds booting before it renders a sample.
 `tests/module_smoke.cpp`, 3446 blocks (10 s) of held-and-retriggered chord per
 run, two runs a cell, underruns counted only inside the note window:
 
-| dsp_clock | 4 voices | 8 voices |
-|---|---|---|
-| 100% | 0, 2 | **137, 141, 142, 159** |
-| 75% (default) | 0, 0, 0 | 0, 0, 0 |
-| 50% | 0, 0, 0 | 0, 0, 0 |
+| dsp_clock | 4 voices | 8 voices | Multi, 2 parts, 4 / 6 / 8 total |
+|---|---|---|---|
+| 100% | 0, 2 | **137, 141, 142, 159** | -- |
+| 75% | 0, 0, 0 | 0, 0, 0 | **15 / 227 / 272** |
+| 50% (default) | 0, 0, 0 | 0, 0, 0 | **0 / 0 / 0** |
+
+**The budget is total sounding voices, not parts.** Multi mode itself costs
+about 21% (13.9 -> 16.9 CPU-s for the same four voices); after that a voice
+costs the same wherever it lives. 75% is clean single-timbrally and breaks in
+Multi past four voices, so the default is 50%.
+
+**50% does not change the sound.** Rendered offline at 50, 75 and 100 and
+compared, the differences sit inside the emulator's own run-to-run variation:
+
+| comparison | rel. diff | correlation | spectral |
+|---|---|---|---|
+| same clock, two runs | 0.280 | 0.9632 | 3.39 dB |
+| 75% vs 100% | 0.096 | 0.9966 | 4.33 dB |
+| 50% vs 100% | 0.275 | 0.9642 | 2.84 dB |
+
+That non-determinism is structural: `mqLib` runs the 68k in `m_ucThread` and
+the DSP in a `DSPThread`, so their interleaving moves the output more than the
+clock does. **No A/B of this emulator can be bit-exact**, upstream harness
+included -- a comparison without that same-clock control measures nothing.
+
+**Voices cannot be split across cores.** The microQ has one DSP56300 and its
+voices are one instruction stream. (The emulator is already multi-threaded --
+that uc thread and DSP thread are why it costs ~1.3 CPU-seconds per second of
+audio while staying real time.)
 
 100% cannot sustain eight voices on Move -- 4% of blocks drop -- so the default
 is 75%: clean at four voices, and 0.3% at eight. 50% was clean in every run.
@@ -76,6 +119,11 @@ quality, which is why it exists and why Osirus does not default to 100 either.
 **Anything measured at eight voices needs repeats**: MoveOriginal's own load
 swings between 50% and 60% of a core and moves this cell with it. The 75%/8
 cell read 0-10 before the queue boost below and 0, 0, 0 after.
+
+**A placeholder is not a default.** The harness sets `dsp_clock` from argv, and
+`atoi("")` is 0, which the module clamps to its MINIMUM -- so passing an empty
+string to mean "leave it alone" quietly measured 25% and reported it as the
+default. Pass `-`.
 
 **A preset change brings its own cold JIT.** The boot warmup can only compile
 the patch that is loaded, so the first notes on a newly selected sound stalled
@@ -122,7 +170,9 @@ submodule pinned to the commit these measurements were taken with.
 2. State save/restore, so a slot remembers its patch. `mqLib::Device`
    implements `getState`/`setState`; nothing is wired up, so a reload returns
    to A1. Osirus (`schwung-virus/src/dsp/virus_plugin.cpp`) is the model.
-3. Editable patch parameters and a Remote UI. Today the module publishes four
-   knobs: preset, gain, DSP clock and buffer. The front panel arrives over
-   sysex already (`EmuLCD`, `EmuLEDs`, `EmuButtons`), which is a route to a
-   real editor.
+3. Editable patch parameters and a Remote UI. Today the module publishes
+   preset, mode, part, part channel, part volume, gain, DSP clock and buffer.
+   The front panel arrives over sysex already (`EmuLCD`, `EmuLEDs`,
+   `EmuButtons`), which is a route to a real editor.
+4. More of the Multi: key ranges and transpose per part are one `ParamWrite`
+   each -- the mechanism is in place, they just need keys.

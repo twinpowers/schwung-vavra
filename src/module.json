@@ -346,13 +346,61 @@
             ]
         },
         {
+            "key": "mode",
+            "name": "Mode",
+            "type": "enum",
+            "options": [
+                "Single",
+                "Multi"
+            ],
+            "default": 0
+        },
+        {
+            "key": "part",
+            "name": "Part",
+            "type": "int",
+            "min": 1,
+            "max": 16,
+            "default": 1,
+            "visible_if": {
+                "key": "mode",
+                "equals": 1
+            }
+        },
+        {
+            "key": "part_channel",
+            "name": "Part Ch",
+            "short_name": "Ch",
+            "type": "int",
+            "min": 0,
+            "max": 16,
+            "default": 0,
+            "visible_if": {
+                "key": "mode",
+                "equals": 1
+            }
+        },
+        {
+            "key": "part_volume",
+            "name": "Part Vol",
+            "short_name": "Vol",
+            "type": "int",
+            "min": 0,
+            "max": 127,
+            "default": 127,
+            "visible_if": {
+                "key": "mode",
+                "equals": 1
+            }
+        },
+        {
             "key": "dsp_clock",
             "name": "DSP Clock",
             "short_name": "Clock",
             "type": "int",
             "min": 25,
             "max": 100,
-            "default": 75,
+            "default": 50,
             "unit": "%"
         },
         {

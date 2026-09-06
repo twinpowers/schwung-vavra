@@ -2,10 +2,30 @@
 
 Waldorf microQ for Schwung/Move, on gearmulator's `mqLib`.
 
-**Status: playable, measured on Move.** It builds, boots the firmware in a
-forked child, plays, and selects any of the 300 factory sounds by name: four
-and eight voices at the default 75% DSP clock, 10 s each, zero underruns. No
-state save/restore and no patch parameters yet. Numbers and the next
+**Status: playable and multitimbral, measured on Move.** It builds, boots the
+firmware in a forked child, plays, selects any of the 300 factory sounds by
+name, and runs the 16-part Multi. Every cell at the default 50% DSP clock
+measured zero underruns, including eight voices across two parts. No state
+save/restore and no patch parameters yet.
+
+## The firmware boots SINGLE + omni, which reads as "the channel does nothing"
+
+One sound on every channel. `mode` switches to Multi, where the 16 parts each
+have a sound, a channel (part n on channel n) and a volume; several parts on
+one channel is how you layer. Verified per channel: Single answers identically
+on 1-4 (rms 3679/3479/3410/3484), Multi answers differently (3696/480/684/666).
+
+**The budget is total sounding voices, not parts** -- Multi costs ~21% once,
+then a voice costs the same wherever it lives. **Voices cannot be split across
+cores**: one DSP56300, one instruction stream. The emulator is already
+multi-threaded (`m_ucThread` + `DSPThread`), which is a different thing.
+
+**The DSP clock does not change the SOUND**, so 50% is free. Rendered offline
+at 50/75/100, the differences sit inside the emulator's own run-to-run
+variation -- two renders at the SAME clock differ more (rel 0.280, corr 0.963)
+than 75 differs from 100 (0.096, 0.997). That non-determinism is the uc/DSP
+thread interleaving, so **no A/B of this emulator can be bit-exact**, upstream
+harness included. Any comparison without a same-clock control measures nothing. Numbers and the next
 steps are in `README.md`; the plan is `docs/plans/2026-09-06-microq-first-audio.md`.
 
 ## The harness measures ITSELF unless it runs as root
@@ -59,8 +79,9 @@ plays a retriggering chord and exits when no step has exceeded 8 ms for two
 seconds. Do not shorten this into a constant.
 
 **100% DSP clock cannot sustain eight voices** -- 137-159 underruns a run, 4% of
-blocks, against 0 at 75% and 0 at 50%. The default is 75: clean at four
-voices. Polyphony on a microQ is DSP-bound, so this dial buys voices, not
+blocks, against 0 at 75% and 0 at 50%. The default is **50**: 75 is clean
+single-timbrally but breaks in Multi past four total voices (15, 227, 272 at
+4, 6, 8) while 50 measured zero everywhere. Polyphony on a microQ is DSP-bound, so this dial buys voices, not
 quality -- the same trade Osirus makes per model. **Repeat any eight-voice
 measurement three times**; MoveOriginal's own load swings 50-60% of a core and
 the first two-rep reading of this cell came back 0-1, which is not what it

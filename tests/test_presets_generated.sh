@@ -36,6 +36,26 @@ if options != rows:
     failures.append(f"src/module.json preset options are stale ({options and len(options)} names); "
                     "re-run tools/gen_presets_header.py")
 
+# The plugin serves its own chain_params and the chain host parses module.json's
+# copy; only the module.json half is visible without a device, so pin the KEY
+# LIST of the two against each other from source. A key in one and not the
+# other is the invented-knob failure again, one level up from the names.
+source = (root / "src/dsp/vavra_plugin.cpp").read_text()
+contract = source[source.index('if(!strcmp(key,"chain_params"))'):source.index('if(!strcmp(key,"ui_hierarchy"))')]
+# Only top-level params: every one is {"key":...,"name":...}, while a
+# visible_if carries its own inner "key" and would double-count.
+in_plugin = re.findall(r'\{"key":"([a-z_]+)","name"', contract)
+in_module = [p["key"] for p in module["chain_params"]]
+if in_plugin != in_module:
+    failures.append(f"chain_params keys differ: plugin {in_plugin} vs module.json {in_module}")
+
+hierarchy = source[source.index('if(!strcmp(key,"ui_hierarchy"))'):]
+hierarchy = hierarchy[:hierarchy.index("\n")]
+in_hierarchy = re.findall(r'"([a-z_]+)"', hierarchy[hierarchy.index('"knobs"'):])
+in_hierarchy = [k for k in in_hierarchy if k not in ("knobs", "params")]
+if sorted(set(in_hierarchy)) != sorted(set(in_plugin)):
+    failures.append(f"ui_hierarchy names {sorted(set(in_hierarchy))} do not match chain_params {sorted(set(in_plugin))}")
+
 if failures:
     for f in failures:
         print("FAIL:", f)
