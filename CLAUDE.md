@@ -2,15 +2,55 @@
 
 Waldorf microQ for Schwung/Move, on gearmulator's `mqLib`.
 
-**Status: scaffolding only.** `CMakeLists.txt`, `scripts/`, `src/module.json` and
-the `libs/gearmulator` pin are real and correct. **`src/dsp/vavra_plugin.cpp`
-does not exist**, so nothing here builds into a module yet. Nothing has run on a
-device.
+**Status: first audio, measured on Move.** It builds, boots the firmware in a
+forked child and plays: four voices at the default 75% DSP clock, 10 s, zero
+underruns. Not yet driven by the Schwung chain host on hardware, and it has no
+presets, no state save/restore and no patch parameters. Numbers and the next
+steps are in `README.md`; the plan is `docs/plans/2026-09-06-microq-first-audio.md`.
+
+## The harness measures ITSELF unless it runs as root
+
+This cost most of a day. `tests/module_smoke.cpp` pins to core 3 at FIFO 70 --
+what Schwung's real SPI callback is -- but only when `geteuid()==0`. Run as
+`ableton` it is SCHED_OTHER on cores 0-2 against the emulator's own FIFO 20
+threads, so it gets descheduled and then **bursts** its catch-up `render_block`
+calls, draining the queue faster than real time. A late consumer is a BURST, not
+a gap -- the same shape Schwung's own SPI notes warn about.
+
+It reported 13-65 underruns a run and, worse, it reported them *plausibly*:
+they clustered in the first second after the first note, which is exactly where
+cold-JIT dropouts would sit. Three separate fixes were built and measured
+against that ghost -- 64-sample emulator steps (worse: 251 underruns, more CPU),
+a child at SCHED_OTHER, and a queue up to 100 ms deep (still 5) -- and a 2x2
+matrix of the last two came back pure noise, 0-52 *within* one cell. That
+uniform noise was the tell. Run as root, the same builds report 0-2, and the
+emulator itself gets faster (proc_ms 7950 vs 9100) because the harness had been
+stealing its cores.
+
+**Always run it as root, and distrust any cell whose repeats disagree.**
+
+## Two real findings that survived
+
+**The JIT warmup must run until the JIT goes QUIET, not for N blocks.** A cold
+path compiles for up to 86 ms against a queue holding 17 ms. A fixed warmup
+cannot cover it: what must compile is not "a note" but note-on, voice
+re-allocation and note-off arriving as separate events over seconds. The child
+plays a retriggering chord and exits when no step has exceeded 8 ms for two
+seconds. Do not shorten this into a constant.
+
+**100% DSP clock cannot sustain eight voices** -- 137-159 underruns a run, 4% of
+blocks, against 0-10 at 75% and 0 at 50%. The default is 75: clean at four
+voices. Polyphony on a microQ is DSP-bound, so this dial buys voices, not
+quality -- the same trade Osirus makes per model. **Repeat any eight-voice
+measurement three times**; MoveOriginal's own load swings 50-60% of a core and
+the first two-rep reading of this cell came back 0-1, which is not what it
+does.
 
 ## Copy the Osirus plugin, not the JP-8000 one
 
-`schwung-virus/src/dsp/virus_plugin.cpp` is the model. It is the other DSP56300
-device, and it already solves everything this port needs:
+`schwung-virus/src/dsp/virus_plugin.cpp` is still the model for what is NOT
+built yet (presets, banks, state, parameters). It is the other DSP56300 device,
+and it already solves:
 
 - the fork into a child process, with a shm audio ring
 - per-model DSP clock scaling (`setDspClockPercent`)
@@ -67,5 +107,9 @@ swap a fresh dump with:
 built from `scripts/Dockerfile` on first run); `scripts/install.sh` deploys to
 `move.local`. `libs/gearmulator` is a submodule pinned to `d7c692c1`, the commit
 every measurement above was taken with.
+
+`tests/runtime_test` (ring + ROM normalization, no device needed) and
+`tests/module_smoke` (the real ABI, on device) are built by the same script and
+both are ARM64 -- they run on Move, not on the Mac.
 
 Note this repo has **no git remote yet** -- create one before relying on it.

@@ -29,21 +29,18 @@ DEST=/data/UserData/schwung/modules/sound_generators/vavra
 echo "Copying module to Move..."
 ssh ableton@move.local "mkdir -p $DEST/roms $DEST/banks"
 scp dist/vavra/dsp.so ableton@move.local:$DEST/dsp.so.new
-scp dist/vavra/module.json dist/vavra/help.json dist/vavra/web_ui.html ableton@move.local:$DEST/
-# The Remote UI's assets. The manager serves them straight from this folder;
-# a stale params.js next to a new dsp.so would decode the wrong bytes.
-scp -r dist/vavra/assets ableton@move.local:$DEST/
+scp dist/vavra/module.json ableton@move.local:$DEST/
 ssh ableton@move.local "mv -f $DEST/dsp.so.new $DEST/dsp.so"
 
 # Set permissions
 echo "Setting permissions..."
-ssh ableton@move.local "chmod -R a+rw $DEST"
+ssh ableton@move.local "chmod a+r $DEST/dsp.so $DEST/module.json; chmod a+rwx $DEST/roms $DEST/banks"
 
 echo ""
 echo "=== Install Complete ==="
 echo "Module installed to: $DEST/"
 echo ""
-echo "IMPORTANT: Place microQ ROM .mid files in:"
+echo "IMPORTANT: Place microQ OS 2.23 .bin or .mid in:"
 echo "  $DEST/roms/"
 echo ""
 echo "Restart Schwung to load the new module."

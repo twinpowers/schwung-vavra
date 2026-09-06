@@ -5,7 +5,6 @@
     "version": "0.0.1",
     "description": "Waldorf microQ emulator (Gearmulator)",
     "author": "dsp56300/gearmulator (port: charlesvestal)",
-    "ui": "ui.js",
     "dsp": "dsp.so",
     "api_version": 2,
     "assets": {
@@ -13,7 +12,7 @@
         "label": "ROMs",
         "extensions": [".bin", ".BIN", ".mid"],
         "description": "Requires a microQ OS 2.23 firmware image: one 512 KB .bin, or a 300-400 KB .mid OS update.",
-        "hint": "Some EPROM dumps are byte-swapped within each 16-bit word and are rejected; the image must begin with the ASCII '2.23'.",
+        "hint": "OS 2.23 EPROM dumps in either byte order are accepted, with .bin or .BIN filenames.",
         "files": [
             {
                 "filename": "microq223.bin",
@@ -30,7 +29,12 @@
         "midi_out": false,
         "default_forward_channel": 1,
         "chainable": true,
+        "forks_processes": true,
         "component_type": "sound_generator"
     },
-    "chain_params": []
+    "chain_params": [
+        {"key": "dsp_clock", "name": "DSP Clock", "short_name": "Clock", "type": "int", "min": 25, "max": 100, "default": 75, "unit": "%"},
+        {"key": "gain", "name": "Gain", "type": "int", "min": 0, "max": 100, "default": 70},
+        {"key": "buffer_ms", "name": "Buffer", "short_name": "Buf", "type": "int", "min": 11, "max": 139, "default": 17, "unit": "ms"}
+    ]
 }

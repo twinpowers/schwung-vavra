@@ -2,9 +2,11 @@
 
 Waldorf microQ for Schwung/Move, on gearmulator's `mqLib`.
 
-**Status: scaffolding.** The build wiring, the gearmulator pin and the module
-metadata are real; `src/dsp/vavra_plugin.cpp` is not written yet. Nothing here
-has run on a device.
+**Status: first audio, measured on Move.** The module builds, loads, boots the
+firmware and plays. Four voices at the default 75% DSP clock ran 10 s with zero
+underruns and a worst-case `render_block` of 26 us. It has not yet been played
+through the Schwung chain UI on hardware, and it has no preset browser, no state
+save/restore and no editable patch parameters -- see [Next](#next).
 
 ## Why the microQ and not one of the others
 
@@ -31,11 +33,41 @@ pins itself to cores 0-2.
 nearly two cores. And boot must be excluded or it reads four times worse still:
 the microQ burns ~16 CPU-seconds booting before it renders a sample.
 
+## Measured on Move
+
+`tests/module_smoke.cpp`, 3446 blocks (10 s) of held-and-retriggered chord per
+run, two runs a cell, underruns counted only inside the note window:
+
+| dsp_clock | 4 voices | 8 voices |
+|---|---|---|
+| 100% | 0, 2 | **137, 141, 142, 159** |
+| 75% (default) | 0, 0, 0 | 0, 5, 10 |
+| 50% | 0, 0, 0 | 0, 0, 0 |
+
+100% cannot sustain eight voices on Move -- 4% of blocks drop -- so the default
+is 75%: clean at four voices, and 0.3% at eight. 50% was clean in every run.
+The microQ's polyphony is DSP-bound, so this dial buys voices rather than
+quality, which is why it exists and why Osirus does not default to 100 either.
+**Anything measured at eight voices needs repeats**: MoveOriginal's own load
+swings between 50% and 60% of a core and moves this cell with it. Boot is **12.6-20.6 s** wall, during which
+`create_instance` has already returned (in ~0.5 ms) and the module renders
+silence. Cost is ~1.3 CPU-seconds per second of audio; worst-case
+`render_block` on the host callback is 26-77 us.
+
+**Run the harness as root or it measures itself.** It only pins to core 3 at
+FIFO 70 -- what the real SPI callback is -- when it can. Run as `ableton` it is
+SCHED_OTHER, competing with the emulator's own FIFO 20 threads on cores 0-2; it
+then gets descheduled and *bursts* its catch-up `render_block` calls, draining
+the queue faster than real time. That reported 13-65 underruns a run, with a
+spread so wide (0-52 within one configuration) that a 2x2 scheduler/buffer
+matrix looked like pure noise -- because it was measuring the instrument. The
+same builds measured correctly report 0-2.
+
 ## Two things that will bite
 
-**That boot cost is a real risk to this port.** ~16 CPU-s against the Virus A's
-3.0. On Move that is module-load latency the user feels, and it should be
-measured against the host's load timeouts before much more is built.
+**Boot is long: 12.6-20.6 s.** ~16 CPU-s against the Virus A's 3.0. The host
+never blocks on it -- `create_instance` returns immediately and the child boots
+on its own thread -- but it is load latency the user waits through.
 
 **ROM images are commonly byte-swapped.** `mqLib::ROM::verifyRom()` requires the
 image to begin with the ASCII `2.23`; the widely circulated `microQ223.BIN`
@@ -51,10 +83,12 @@ submodule pinned to the commit these measurements were taken with.
 
 ## Next
 
-1. Write `src/dsp/vavra_plugin.cpp`. The Osirus plugin
-   (`schwung-virus/src/dsp/virus_plugin.cpp`) is the model to copy, not the
-   JP-8000 one -- it is the other DSP56300 device, it already solves the fork,
-   the per-model DSP clock and the shm audio ring, and its ring is free of the
-   two defects found in `jePipeline`.
-2. Measure boot on device before building any UI.
-3. Decide a default DSP clock percent the way Osirus does per model.
+1. Play it through the Schwung chain on hardware. Everything above was measured
+   by a standalone harness against the same `dsp.so` the host loads; the module
+   has never been driven by the chain host itself.
+2. Preset browsing and state save/restore. `mqLib::Device` implements
+   `getState`/`setState` and the ROM carries banks; none of it is wired up, so
+   the slot currently has no patch to persist. Osirus
+   (`schwung-virus/src/dsp/virus_plugin.cpp`) is the model.
+3. Editable patch parameters and a Remote UI. Today the module publishes three
+   knobs: gain, DSP clock and buffer.

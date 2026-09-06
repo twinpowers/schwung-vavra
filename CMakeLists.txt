@@ -54,3 +54,14 @@ add_library(dsp SHARED src/dsp/vavra_plugin.cpp)
 set_target_properties(dsp PROPERTIES PREFIX "" OUTPUT_NAME "dsp")
 target_include_directories(dsp PRIVATE ${GEARMULATOR_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dsp PRIVATE mqLib synthLib baseLib Threads::Threads)
+# Move's libstdc++ predates the builder's condition_variable ABI. Keep the
+# bundled runtime private, including its GNU_UNIQUE locale symbols.
+target_link_options(dsp PRIVATE -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL)
+
+add_executable(module_smoke tests/module_smoke.cpp)
+target_include_directories(module_smoke PRIVATE src)
+target_link_libraries(module_smoke PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+add_executable(runtime_test tests/runtime_test.cpp)
+target_include_directories(runtime_test PRIVATE src)
+target_link_libraries(runtime_test PRIVATE Threads::Threads)
+target_compile_options(runtime_test PRIVATE -UNDEBUG)

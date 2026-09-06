@@ -1,4 +1,4 @@
-# JP-8000 Module Build Environment
+# microQ Module Build Environment
 # Targets: Ableton Move (aarch64 Linux, glibc 2.35)
 # Uses Ubuntu 22.04 for glibc compatibility with the device.
 

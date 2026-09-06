@@ -21,16 +21,6 @@ if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
         echo ""
     fi
 
-    # The Remote UI's parameter table is generated from the header the plugin
-    # is built from. Done HERE, on the host, because the build image has no
-    # python3; the container step below only copies the result. CI then fails
-    # if the committed copy differs from what this tree generates.
-    if command -v python3 >/dev/null 2>&1; then
-        python3 "$REPO_ROOT/src/tools/gen_remote_params.py"
-    else
-        echo "python3 not found: shipping the committed src/remote/assets/params.js"
-    fi
-
     # Run build inside container
     echo "Running build..."
     docker run --rm \
@@ -63,31 +53,23 @@ cmake -B build \
 
 # Build plugin
 echo "Building plugin..."
-cmake --build build --target vavra-move-plugin -j$(nproc) 2>&1
+cmake --build build --target dsp module_smoke runtime_test -j"${BUILD_JOBS:-4}" 2>&1
 
 # Package
 echo "Packaging..."
 mkdir -p dist/vavra
 
 # Copy files to dist
-cat src/module.json > dist/vavra/module.json
-cat src/help.json > dist/vavra/help.json
-cat build/dsp.so > dist/vavra/dsp.so
+cp src/module.json dist/vavra/module.json
+cp build/dsp.so dist/vavra/dsp.so
 chmod +x dist/vavra/dsp.so
-
-# The Remote UI: web_ui.html beside module.json is what Schwung Manager looks
-# for, and assets/ is served under it (params.js was regenerated on the host
-# above; this side of the script has no python3).
-rm -rf dist/vavra/assets
-cp src/remote/web_ui.html dist/vavra/web_ui.html
-cp -R src/remote/assets dist/vavra/assets
 
 # Asset directory placeholders (ROMs required, extra banks optional)
 mkdir -p dist/vavra/roms dist/vavra/banks
 
 # Create tarball for release
 cd dist
-tar -czvf vavra-module.tar.gz vavra/
+tar -czvf vavra-module.tar.gz vavra/module.json vavra/dsp.so
 cd ..
 
 echo ""
@@ -98,5 +80,5 @@ echo ""
 echo "To install on Move:"
 echo "  ./scripts/install.sh"
 echo ""
-echo "IMPORTANT: Place microQ ROM .mid files in the roms/ directory on device:"
+echo "IMPORTANT: Place microQ OS 2.23 .bin or .mid in the roms/ directory on device:"
 echo "  /data/UserData/schwung/modules/sound_generators/vavra/roms/"
