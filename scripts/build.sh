@@ -53,7 +53,7 @@ cmake -B build \
 
 # Build plugin
 echo "Building plugin..."
-cmake --build build --target dsp module_smoke runtime_test -j"${BUILD_JOBS:-4}" 2>&1
+cmake --build build --target dsp module_smoke runtime_test dump_presets -j"${BUILD_JOBS:-4}" 2>&1
 
 # Package
 echo "Packaging..."

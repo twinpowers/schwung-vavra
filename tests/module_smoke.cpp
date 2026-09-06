@@ -60,15 +60,27 @@ int main(int argc, char** argv) {
         printf("cancel_seconds=%.6f\n",seconds(start));
         return seconds(start)<0.5 ? 0 : 1;
     }
-    char contract[2048]{};
+    // The preset enum alone is ~7 KB of options; a 2 KB buffer would make the
+    // module report -1 here and read as a broken contract.
+    static char contract[65536];
     if(api->get_param(inst,"is_loading",contract,sizeof(contract))<1 || strcmp(contract,"1")) {
         fprintf(stderr,"FAIL: host is_loading contract\n"); api->destroy_instance(inst); dlclose(lib); return 1;
     }
-    if(api->get_param(inst,"chain_params",contract,sizeof(contract))<1 || !strstr(contract,"dsp_clock")) {
-        fprintf(stderr,"FAIL: host chain_params contract\n"); api->destroy_instance(inst); dlclose(lib); return 1;
+    const int contractLen=api->get_param(inst,"chain_params",contract,sizeof(contract));
+    if(contractLen<1 || !strstr(contract,"dsp_clock") || !strstr(contract,"LosAngeles2019")) {
+        fprintf(stderr,"FAIL: host chain_params contract (len %d)\n",contractLen);
+        api->destroy_instance(inst); dlclose(lib); return 1;
+    }
+    printf("chain_params_len=%d\n",contractLen);
+    if(const char* path=getenv("VAVRA_DUMP_CONTRACT")) {
+        if(FILE* f=fopen(path,"w")) { fwrite(contract,1,contractLen,f); fclose(f); }
     }
     if(argc>2) api->set_param(inst,"dsp_clock",argv[2]);
     if(argc>4) api->set_param(inst,"buffer_ms",argv[4]);
+    // argv[5]: bank:program, sent as Bank Select MSB + Program Change once the
+    // emulator is ready, to find out whether the ROM presets are reachable
+    // over plain MIDI at all.
+    const char* program = argc>5 ? argv[5] : nullptr;
     char value[512]{};
     int16_t audio[256];
     bool ready=false;
@@ -100,8 +112,28 @@ int main(int argc, char** argv) {
         if(now!=seen) { printf("settle_block=%d underruns=%d t=%.3f\n",i,now,seconds(start)); fflush(stdout); seen=now; }
         std::this_thread::sleep_for(std::chrono::microseconds(2902));
     }
+    printf("settle_done t=%.3f\n",seconds(start)); fflush(stdout);
+    if(program) {
+        // bank:preset through the module's own params, 1-based like the device.
+        int bank=0,pgm=1;
+        if(sscanf(program,"%d:%d",&bank,&pgm)!=2) { bank=0; pgm=atoi(program); }
+        char text[16];
+        snprintf(text,sizeof(text),"%d",bank); api->set_param(inst,"bank",text);
+        snprintf(text,sizeof(text),"%d",pgm);  api->set_param(inst,"preset",text);
+        printf("program=%d:%d\n",bank,pgm);
+        // The firmware needs time to swap the edit buffer before it is played.
+        for(int i=0;i<172;++i) { api->render_block(inst,audio,128);
+            std::this_thread::sleep_for(std::chrono::microseconds(2902)); }
+        if(api->get_param(inst,"preset_name",value,sizeof(value))>0) printf("preset_name=%s\n",value);
+        // Loading a patch stalls the emulator briefly -- new firmware work and
+        // new JIT paths. That is a click when you change sound, not a synth
+        // that cannot hold a note, so it is counted on its own and the
+        // playing baseline is taken AFTER it.
+        const int changeUnderruns=underrunsOf(api,inst)-seen;
+        seen=underrunsOf(api,inst);
+        printf("preset_change_underruns=%d\n",changeUnderruns);
+    }
     const int underrunsBeforeNotes=seen;
-    printf("notes_at_block=0 t=%.3f\n",seconds(start)); fflush(stdout);
     const int notes[]={60,64,67,72,76,79,84,88};
     const int voices=argc>3 ? std::clamp(atoi(argv[3]),1,8) : 4;
     for(int i=0;i<voices;++i) { uint8_t msg[]={0x90,(uint8_t)notes[i],100}; api->on_midi(inst,msg,3,0); }

@@ -3,7 +3,9 @@
  * exchanges bounded messages and consumes a shared audio ring. */
 #include "plugin_api.h"
 #include "runtime.h"
+#include "presets_os223.h"
 #include "mqLib/device.h"
+#include "mqLib/mqmiditypes.h"
 #include "mqLib/rom.h"
 #include "dsp56kBase/logging.h"
 #include <algorithm>
@@ -52,6 +54,15 @@ constexpr uint32_t StallUs=8000;
 // The microQ's polyphony is DSP-bound, so this is the polyphony-for-headroom
 // dial Osirus has, and like Osirus it does not default to 100.
 constexpr int DspClockDefault=75;
+// OS 2.23 ships 3 banks of 100. Names live in docs/presets-os223.tsv, dumped
+// by tools/dump_presets.cpp -- but the module reads the CURRENT name off the
+// device's own display rather than from any table, so a different ROM cannot
+// make it lie.
+constexpr int BankCount=3, PresetsPerBank=100;
+// How long the queue runs deep after a preset change, to swallow its JIT.
+constexpr int BoostSeconds=4;
+static_assert(sizeof(vavra::g_presetNames)/sizeof(*vavra::g_presetNames)==BankCount*PresetsPerBank,
+    "the generated name table must cover every Program Change slot");
 using Clock=std::chrono::steady_clock;
 struct Stereo { int16_t l=0,r=0; };
 struct Midi { uint16_t size=0; uint8_t bytes[1024]{}; };
@@ -59,6 +70,11 @@ struct Shared {
     vavra::Ring<Stereo,8192> audio;
     vavra::Ring<Midi,128> midi;
     std::atomic<int> ready{0}, failed{0}, clock{DspClockDefault}, gain{70}, targetFill{TargetFillDefault};
+    // Preset selection is ONE index 0..299 in Program Change order, not a
+    // bank plus a number: two params for one choice is two things to keep in
+    // step, and the name table is indexed this way anyway.
+    std::atomic<int> preset{0}, presetPending{1};
+    char lcdName[24]{};
     std::atomic<uint32_t> underruns{0}, midiDrops{0}, blocks{0}, bootMs{0}, cpuMs{0};
     std::atomic<uint32_t> warmupBlocks{0};
     // Producer-side truth: the longest single emulator step, and how
@@ -202,13 +218,31 @@ static void childMain(Instance* inst) {
         }
         shm->warmupBlocks=warmBlock;
         shm->bootMs=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-start).count();
+        auto boostUntil=Clock::now();
         const auto cpuStart=cpuMs();
         for(;;) {
-            const uint32_t targetFill=static_cast<uint32_t>(shm->targetFill.load());
+            // The warmup can only compile the patch that was loaded at boot.
+            // Selecting another one brings its own cold paths, which stall the
+            // emulator on that patch's FIRST notes -- measured as 5-8 dropped
+            // blocks, at every DSP clock, so it is not a capacity problem. The
+            // queue is run deep for a few seconds after a change instead: the
+            // extra audio is produced out of the ~20% steady-state headroom,
+            // and latency returns to the user's setting once the JIT is quiet.
+            uint32_t targetFill=static_cast<uint32_t>(shm->targetFill.load());
+            if(Clock::now()<boostUntil) targetFill=std::min<uint32_t>(targetFill*4,TargetFillMax);
             if(shm->audio.available()>=targetFill) { usleep(500); continue; }
             int requested=shm->clock.load();
             if(requested!=applied) { device.setDspClockPercent(requested); applied=requested; }
             midiIn.clear(); midiOut.clear();
+            // Bank select is CC 32 on this firmware. CC 0 is accepted and
+            // ignored -- every bank then reads back as A001-A100.
+            if(shm->presetPending.exchange(0)) {
+                boostUntil=Clock::now()+std::chrono::seconds(BoostSeconds);
+                const int index=std::clamp(shm->preset.load(),0,BankCount*PresetsPerBank-1);
+                const int bank=index/PresetsPerBank, program=index%PresetsPerBank;
+                midiIn.emplace_back(synthLib::MidiEventSource::Host,0xb0,32,static_cast<uint8_t>(bank));
+                midiIn.emplace_back(synthLib::MidiEventSource::Host,0xc0,static_cast<uint8_t>(program),0);
+            }
             Midi message;
             while(shm->midi.pop(message)) {
                 synthLib::SMidiEvent event(synthLib::MidiEventSource::Host);
@@ -222,6 +256,25 @@ static void childMain(Instance* inst) {
             }
             const auto procStart=Clock::now();
             static_cast<synthLib::Device&>(device).process(inputs,outputs,Chunk,midiIn,midiOut);
+            // The firmware streams its 2x20 display as SysexCommand::EmuLCD.
+            // Row 2 is the current sound's 16-char name, which is the only
+            // authority for it: the names are not plain text in the ROM.
+            for(const auto& event:midiOut) {
+                const auto& sysex=event.sysex;
+                if(sysex.size()<46) continue;
+                if(sysex[4]!=static_cast<uint8_t>(mqLib::SysexCommand::EmuLCD)) continue;
+                // The whole 20-char row: the name field is inset by two
+                // spaces, so copying only 16 from the row start dropped the
+                // last two characters of every long name.
+                char row[21]{};
+                for(int i=0;i<20;++i) row[i]=static_cast<char>(sysex[5+20+i]);
+                int end=20; while(end>0 && row[end-1]==' ') row[--end]=0;
+                const char* start=row; while(*start==' ') ++start;
+                memmove(row,start,strlen(start)+1);
+                // Transient firmware messages ("[dumping Sound A001]") land on
+                // row 1, never here, so row 2 needs no filtering.
+                memcpy(shm->lcdName,row,sizeof(row));
+            }
             const auto procUs=static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-procStart).count());
             if(procUs>shm->maxProcUs.load()) shm->maxProcUs=procUs;
             // A block is worth Chunk/44100 of wall; over that is slower than realtime.
@@ -316,6 +369,11 @@ static void setParam(void* context,const char* key,const char* value) {
     if(!strcmp(key,"gain")) inst->shm->gain=std::clamp(atoi(value),0,100);
     // Buffer in milliseconds: what the user actually trades away is latency.
     if(!strcmp(key,"buffer_ms")) inst->shm->targetFill=std::clamp(atoi(value)*44100/1000,TargetFillMin,TargetFillMax);
+    // The child owns the MIDI; these only record the wish and wake it.
+    if(!strcmp(key,"preset")) {
+        inst->shm->preset=std::clamp(atoi(value),0,BankCount*PresetsPerBank-1);
+        inst->shm->presetPending=1;
+    }
 }
 static int getError(void* context,char* buffer,int size) {
     auto* inst=static_cast<Instance*>(context); if(!inst || !buffer || size<=0) return 0;
@@ -330,12 +388,26 @@ static int getParam(void* context,const char* key,char* buffer,int size) {
     auto* s=inst->shm;
     if(!strcmp(key,"name")) return snprintf(buffer,size,"microQ");
     if(!strcmp(key,"loading") || !strcmp(key,"is_loading")) return snprintf(buffer,size,"%d",!s->ready.load() && !s->failed.load() && !inst->workerError.load());
-    if(!strcmp(key,"chain_params")) return snprintf(buffer,size,"%s",R"([{"key":"dsp_clock","name":"DSP Clock","short_name":"Clock","type":"int","min":25,"max":100,"default":75,"unit":"%"},{"key":"gain","name":"Gain","type":"int","min":0,"max":100,"default":70},{"key":"buffer_ms","name":"Buffer","short_name":"Buf","type":"int","min":11,"max":139,"default":17,"unit":"ms"}])");
-    if(!strcmp(key,"ui_hierarchy")) return snprintf(buffer,size,"%s",R"({"pad_layout":"chromatic","levels":{"root":{"label":"microQ","knobs":["gain","dsp_clock","buffer_ms"],"params":["gain","dsp_clock","buffer_ms"]}}})");
+    if(!strcmp(key,"chain_params")) {
+        // Built here rather than stored: 300 option strings are ~7 KB, the
+        // host's ceiling is 65535 (SHADOW_PARAM_VALUE_LEN) and it REJECTS the
+        // module outright above it, so the write is bounded and checked.
+        int used=snprintf(buffer,size,"%s",R"([{"key":"preset","name":"Preset","type":"enum","default":0,"options":[)");
+        for(size_t i=0;i<sizeof(vavra::g_presetNames)/sizeof(*vavra::g_presetNames) && used<size;++i)
+            used+=snprintf(buffer+used,size-used,"%s\"%s\"",i?",":"",vavra::g_presetNames[i]);
+        if(used>=size) { buffer[0]=0; return -1; }
+        used+=snprintf(buffer+used,size-used,"%s",R"(]},{"key":"dsp_clock","name":"DSP Clock","short_name":"Clock","type":"int","min":25,"max":100,"default":75,"unit":"%"},{"key":"gain","name":"Gain","type":"int","min":0,"max":100,"default":70},{"key":"buffer_ms","name":"Buffer","short_name":"Buf","type":"int","min":11,"max":139,"default":17,"unit":"ms"}])");
+        return used<size ? used : -1;
+    }
+    if(!strcmp(key,"ui_hierarchy")) return snprintf(buffer,size,"%s",R"({"pad_layout":"chromatic","levels":{"root":{"label":"microQ","knobs":["preset","gain","dsp_clock","buffer_ms"],"params":["preset","gain","dsp_clock","buffer_ms"]}}})");
     if(!strcmp(key,"loading_status")) return snprintf(buffer,size,"%s",s->ready.load() ? "Ready" : "Booting microQ...");
     if(!strcmp(key,"dsp_clock")) return snprintf(buffer,size,"%d",s->clock.load());
     if(!strcmp(key,"gain")) return snprintf(buffer,size,"%d",s->gain.load());
     if(!strcmp(key,"buffer_ms")) return snprintf(buffer,size,"%d",s->targetFill.load()*1000/44100);
+    if(!strcmp(key,"preset")) return snprintf(buffer,size,"%d",s->preset.load());
+    // The LIVE name, off the device's own display -- so a ROM whose sounds
+    // differ from the compiled-in table still reports the truth.
+    if(!strcmp(key,"preset_name")) return snprintf(buffer,size,"%s",s->lcdName);
     if(!strcmp(key,"stalls")) {
         int used=0;
         used+=snprintf(buffer+used,size-used,"warm_stalls=%u",s->warmStalls.load());

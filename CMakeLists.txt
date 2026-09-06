@@ -65,3 +65,8 @@ add_executable(runtime_test tests/runtime_test.cpp)
 target_include_directories(runtime_test PRIVATE src)
 target_link_libraries(runtime_test PRIVATE Threads::Threads)
 target_compile_options(runtime_test PRIVATE -UNDEBUG)
+
+add_executable(dump_presets tools/dump_presets.cpp)
+target_include_directories(dump_presets PRIVATE ${GEARMULATOR_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dump_presets PRIVATE mqLib synthLib baseLib Threads::Threads)
+target_link_options(dump_presets PRIVATE -static-libstdc++ -static-libgcc)

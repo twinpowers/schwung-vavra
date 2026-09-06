@@ -2,10 +2,10 @@
 
 Waldorf microQ for Schwung/Move, on gearmulator's `mqLib`.
 
-**Status: first audio, measured on Move.** It builds, boots the firmware in a
-forked child and plays: four voices at the default 75% DSP clock, 10 s, zero
-underruns. Not yet driven by the Schwung chain host on hardware, and it has no
-presets, no state save/restore and no patch parameters. Numbers and the next
+**Status: playable, measured on Move.** It builds, boots the firmware in a
+forked child, plays, and selects any of the 300 factory sounds by name: four
+and eight voices at the default 75% DSP clock, 10 s each, zero underruns. No
+state save/restore and no patch parameters yet. Numbers and the next
 steps are in `README.md`; the plan is `docs/plans/2026-09-06-microq-first-audio.md`.
 
 ## The harness measures ITSELF unless it runs as root
@@ -29,6 +29,26 @@ stealing its cores.
 
 **Always run it as root, and distrust any cell whose repeats disagree.**
 
+## The preset names are not in the ROM, and bank select is CC 32
+
+Scanning all 524288 bytes for a 16-char name table at any stride finds nothing.
+The firmware streams its 2x20 front panel as `SysexCommand::EmuLCD`, so
+`tools/dump_presets.cpp` boots it once and reads the names off the screen.
+**Bank select is CC 32; CC 0 is accepted and ignored** -- a dump taken with CC 0
+came back reading `A001-A100` for all three banks, which looks exactly like a
+correct dump of a machine with one bank. The result is committed as
+`docs/presets-os223.tsv`, compiled in by `tools/gen_presets_header.py` and
+pinned by `tests/test_presets_generated.sh`; the LIVE name still comes off the
+LCD so a different ROM cannot make the module lie.
+
+**The module selects A1 at boot** -- left alone the firmware lands on A17
+`11KHz Solo`, which is arbitrary and sounds like a kick with reverb.
+
+**A preset change brings its own cold JIT**, because the warmup can only
+compile the patch that was loaded: 5-8 dropped blocks on the new sound's first
+notes, at every DSP clock, which is what rules out capacity. The queue runs
+four times deep for 4 s after a change.
+
 ## Two real findings that survived
 
 **The JIT warmup must run until the JIT goes QUIET, not for N blocks.** A cold
@@ -39,7 +59,7 @@ plays a retriggering chord and exits when no step has exceeded 8 ms for two
 seconds. Do not shorten this into a constant.
 
 **100% DSP clock cannot sustain eight voices** -- 137-159 underruns a run, 4% of
-blocks, against 0-10 at 75% and 0 at 50%. The default is 75: clean at four
+blocks, against 0 at 75% and 0 at 50%. The default is 75: clean at four
 voices. Polyphony on a microQ is DSP-bound, so this dial buys voices, not
 quality -- the same trade Osirus makes per model. **Repeat any eight-voice
 measurement three times**; MoveOriginal's own load swings 50-60% of a core and
